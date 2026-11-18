@@ -582,54 +582,94 @@ local function getPetValue(pet)
     return info
 end
 
--- v2: scan ClientPets + Pets + DownedPets + Downed + WildPets + workspace direct (filtered by Value/Rarity), dedupe, EXCLUDE base pets
+-- v2 FIXED: scan ClientPets + Pets + DownedPets + Downed + WildPets + workspace direct + ReplicatedStorage + recursive workspace fallback
+-- Relaxed: no longer requires Value/Rarity attribute for workspace-direct pets; any Model with BasePart that isn't a player character counts
 local PET_SCAN_CACHE = {}
 local PET_SCAN_CACHE_AT = 0
 local PET_SCAN_CACHE_TTL = 0.4
+
+local function isLikelyPet(inst)
+    if not inst then return false end
+    if Players:GetPlayerFromCharacter(inst) then return false end
+    if inst:IsA("BasePart") then return true end
+    if inst:IsA("Model") then
+        local hasPart = inst:FindFirstChildWhichIsA("BasePart", true) ~= nil
+        return hasPart
+    end
+    if inst:IsA("Folder") then
+        local hasPart = inst:FindFirstChildWhichIsA("BasePart", true) ~= nil
+        return hasPart
+    end
+    return false
+end
 
 local function scanFolderForPets(folder, out, seen)
     if not folder then return end
     for _, child in ipairs(folder:GetChildren()) do
         pcall(function()
-            if child:IsA("Model") or child:IsA("Folder") or child:IsA("BasePart") then
-                if not seen[child] then
-                    local hasPart = false
-                    pcall(function()
-                        if child:IsA("BasePart") then hasPart = true
-                        elseif child:IsA("Model") or child:IsA("Folder") then hasPart = child:FindFirstChildWhichIsA("BasePart", true) ~= nil end
-                    end)
-                    if not hasPart then return end
-                    if Players:GetPlayerFromCharacter(child) then return end
-                    local inBase = false
-                    pcall(function() inBase = isInBase(child) end)
-                    if inBase then return end
+            if isLikelyPet(child) and not seen[child] then
+                local inBase = false
+                pcall(function() inBase = isInBase(child) end)
+                if not inBase then
                     seen[child] = true
                     table.insert(out, child)
                 end
-                -- Recurse one level into subfolders (World1/World2)
-                if child:IsA("Folder") then
-                    for _, sub in ipairs(child:GetChildren()) do
-                        pcall(function()
-                            if (sub:IsA("Model") or sub:IsA("BasePart")) and not seen[sub] then
-                                local hasPart2 = false
-                                pcall(function()
-                                    if sub:IsA("BasePart") then hasPart2 = true
-                                    elseif sub:IsA("Model") then hasPart2 = sub:FindFirstChildWhichIsA("BasePart", true) ~= nil end
-                                end)
-                                if not hasPart2 then return end
-                                if Players:GetPlayerFromCharacter(sub) then return end
-                                local inBase2 = false
-                                pcall(function() inBase2 = isInBase(sub) end)
-                                if inBase2 then return end
-                                seen[sub] = true
-                                table.insert(out, sub)
-                            end
-                        end)
-                    end
-                end
+            end
+            -- Recurse into subfolders (World1/World2 etc)
+            if child:IsA("Folder") and not seen[child] then
+                scanFolderForPets(child, out, seen)
             end
         end)
     end
+end
+
+local function scanWorkspaceDirect(out, seen)
+    pcall(function()
+        for _, child in ipairs(workspace:GetChildren()) do
+            if isLikelyPet(child) and not seen[child] then
+                local inBase = false
+                pcall(function() inBase = isInBase(child) end)
+                if not inBase then
+                    seen[child] = true
+                    table.insert(out, child)
+                end
+            end
+        end
+    end)
+end
+
+local function scanReplicatedStorage(out, seen)
+    pcall(function()
+        local RS = game:GetService("ReplicatedStorage")
+        if not RS then return end
+        for _, child in ipairs(RS:GetDescendants()) do
+            if isLikelyPet(child) and not seen[child] then
+                local inBase = false
+                pcall(function() inBase = isInBase(child) end)
+                if not inBase then
+                    seen[child] = true
+                    table.insert(out, child)
+                end
+            end
+        end
+    end)
+end
+
+local function scanServerStorage(out, seen)
+    pcall(function()
+        local SS = game:GetService("ServerStorage")
+        if not SS then return end
+        for _, child in ipairs(SS:GetDescendants()) do
+            if isLikelyPet(child) and not seen[child] then
+                local inBase = false
+                pcall(function() inBase = isInBase(child) end)
+                if not inBase then
+                    seen[child] = true
+                    table.insert(out, child)
+                end
+            end
+        end
+    end)
 end
 
 local function getAllPetsUniversal()
@@ -640,33 +680,36 @@ local function getAllPetsUniversal()
     PET_SCAN_CACHE_AT = now
     local out = {}
     local seen = {}
-    -- Known pet folders
+    -- Known pet folders in workspace
     for _, name in ipairs({"ClientPets","Pets","DownedPets","Downed","WildPets"}) do
         scanFolderForPets(workspace:FindFirstChild(name), out, seen)
     end
-    -- Workspace-direct pets (downed pets often reparented to workspace) - strict filter
-    pcall(function()
-        for _, child in ipairs(workspace:GetChildren()) do
-            if (child:IsA("Model") or child:IsA("BasePart")) and not seen[child] then
-                local looksPet = child:GetAttribute("Value") or child:GetAttribute("Rarity") or child:GetAttribute("Income") or child:GetAttribute("PetId") or child:GetAttribute("Pet") or child:FindFirstChild("Value")
-                if looksPet then
-                    local hasPart = false
-                    pcall(function()
-                        if child:IsA("BasePart") then hasPart = true
-                        elseif child:IsA("Model") then hasPart = child:FindFirstChildWhichIsA("BasePart", true) ~= nil end
-                    end)
-                    if hasPart and not Players:GetPlayerFromCharacter(child) then
-                        local inBase = false
-                        pcall(function() inBase = isInBase(child) end)
-                        if not inBase then
-                            seen[child] = true
-                            table.insert(out, child)
-                        end
+    -- Workspace-direct pets
+    scanWorkspaceDirect(out, seen)
+    -- If workspace scan found nothing, broaden the search
+    if #out == 0 then
+        -- Recursive workspace scan (catches pets in any folder)
+        pcall(function()
+            for _, child in ipairs(workspace:GetDescendants()) do
+                if isLikelyPet(child) and not seen[child] then
+                    local inBase = false
+                    pcall(function() inBase = isInBase(child) end)
+                    if not inBase then
+                        seen[child] = true
+                        table.insert(out, child)
                     end
                 end
             end
-        end
-    end)
+        end)
+    end
+    if #out == 0 then
+        -- ReplicatedStorage (pets may be stored there before spawning)
+        scanReplicatedStorage(out, seen)
+    end
+    if #out == 0 then
+        -- ServerStorage (some games store pets here)
+        scanServerStorage(out, seen)
+    end
     PET_SCAN_CACHE = out
     return out
 end
@@ -963,8 +1006,6 @@ local function shouldShoot(pet)
     if not pet or not pet.Parent then return false end
     local cam = workspace.CurrentCamera
     if not cam then return false end
-    -- v3: air pets need angular + distance-scaled tolerance, not fixed 60px.
-    -- At 3000 studs pet is tiny (5-15px), fixed 60px + movement jitter = never shoot. At close range 60px is too loose.
     local aimPoint, isAir = getAimPoint(pet, cam.CFrame.Position)
     if not aimPoint then return false end
     local v, on = cam:WorldToViewportPoint(aimPoint)
@@ -972,14 +1013,14 @@ local function shouldShoot(pet)
     local cx, cy = cam.ViewportSize.X/2, cam.ViewportSize.Y/2
     local dx, dy = v.X - cx, v.Y - cy
     local dist = (aimPoint - cam.CFrame.Position).Magnitude
-    -- Distance-scaled px tolerance from CONFIG
+    -- Distance-scaled px tolerance from CONFIG (more lenient for distant/small pets)
     local tolPx = CONFIG.AIM_TOLERANCE_PX
     if isAir then
-        tolPx = math.clamp(CONFIG.AIM_TOLERANCE_PX + 50 - dist / 50, 35, CONFIG.AIM_TOLERANCE_PX + 50)
+        tolPx = math.clamp(CONFIG.AIM_TOLERANCE_PX + 60 - dist / 40, 45, CONFIG.AIM_TOLERANCE_PX + 60)
     else
-        tolPx = math.clamp(CONFIG.AIM_TOLERANCE_PX + 20 - dist / 80, 40, CONFIG.AIM_TOLERANCE_PX + 20)
+        tolPx = math.clamp(CONFIG.AIM_TOLERANCE_PX + 30 - dist / 60, 50, CONFIG.AIM_TOLERANCE_PX + 30)
     end
-    -- Also check 3D angular tolerance from CONFIG
+    -- 3D angular tolerance from CONFIG (more lenient)
     local look = cam.CFrame.LookVector
     local toPet = (aimPoint - cam.CFrame.Position).Unit
     local dot = math.clamp(look:Dot(toPet), -1, 1)
@@ -995,12 +1036,8 @@ local function shouldShoot(pet)
     else
         AirAimState.frames = 0
     end
-    -- v3: require 2 consecutive frames in tolerance for air (moving), 1 for ground is enough but 2 is safer to avoid waste
-    if isAir then
-        return AirAimState.frames >= 2
-    else
-        return AirAimState.frames >= 1
-    end
+    -- 1 consecutive frame in tolerance is enough for both air and ground
+    return AirAimState.frames >= 1
 end
 local function shootPet(pet)
     if os.clock() - lastShotAt < CONFIG.SHOOT_COOLDOWN then return false end
@@ -1462,13 +1499,21 @@ local function aimAtPet(pet)
     pcall(function() aimPoint = getAimPoint(pet, cam.CFrame.Position) end)
     if not aimPoint then pcall(function() aimPoint = getPetCenter(pet) end) end
     if not aimPoint then return false end
-    local okCam = pcall(function() cam.CFrame = CFrame.lookAt(cam.CFrame.Position, aimPoint) end)
-    pcall(function()
+    local v, on = cam:WorldToViewportPoint(aimPoint)
+    if not on or v.Z <= 0 then return false end
+    -- PRIMARY: VIM mouse move (game scoped camera follows mouse, works even when scoped)
+    local okVIM = pcall(function()
         local VIM = game:GetService("VirtualInputManager")
-        local v, on = cam:WorldToViewportPoint(aimPoint)
-        if on then VIM:SendMouseMoveEvent(v.X, v.Y, game) end
+        VIM:SendMouseMoveEvent(v.X, v.Y, game)
     end)
-    return okCam
+    -- FALLBACK: only set camera CFrame when NOT scoped (scoped camera overrides CFrame every frame)
+    local fov = 70
+    pcall(function() fov = cam.FieldOfView end)
+    local isScoped = fov < 40
+    if not isScoped then
+        pcall(function() cam.CFrame = CFrame.lookAt(cam.CFrame.Position, aimPoint) end)
+    end
+    return okVIM
 end
 
 local function shootPet(pet)
@@ -1573,29 +1618,32 @@ local function findMinigameGui()
             local ok, desc = pcall(function() return root:GetDescendants() end)
             if ok and desc then
                 for _, f in ipairs(desc) do
-                    if f:IsA("Frame") and f.Visible then
+                    if f:IsA("Frame") or f:IsA("ScrollingFrame") or f:IsA("CanvasGroup") then
+                        if not f.Visible then continue end
                         local sg = f:FindFirstAncestorWhichIsA("ScreenGui")
-                        if sg and sg.Enabled == false then
-                            -- not open
-                        elseif f.AbsoluteSize.X > 50 and f.AbsoluteSize.Y > 50 then
-                            local hasScore, hasCombo, hasNext, hasSpeed, hasBonus = false, false, false, false, false
+                        if sg and sg.Enabled == false then continue end
+                        local sz = f.AbsoluteSize
+                        if sz.X > 60 and sz.Y > 60 then
+                            local textCount = 0
+                            local hasMinigameKeyword = false
+                            local hasDuckKeyword = false
                             pcall(function()
                                 for _, d in ipairs(f:GetDescendants()) do
                                     if d:IsA("TextLabel") or d:IsA("TextButton") then
                                         local t = string.lower(tostring(d.Text or ""))
-                                        if string.find(t, "score", 1, true) then hasScore = true end
-                                        if string.find(t, "combo", 1, true) then hasCombo = true end
-                                        if string.find(t, "next", 1, true) then hasNext = true end
-                                        if string.find(t, "speed", 1, true) then hasSpeed = true end
-                                        if string.find(t, "bonus", 1, true) then hasBonus = true end
+                                        textCount = textCount + 1
+                                        if string.find(t, "score", 1, true) or string.find(t, "combo", 1, true) or string.find(t, "next", 1, true) or string.find(t, "speed", 1, true) or string.find(t, "bonus", 1, true) or string.find(t, "duck", 1, true) or string.find(t, "target", 1, true) or string.find(t, "shoot", 1, true) then
+                                            hasMinigameKeyword = true
+                                        end
+                                        if string.find(t, "duck", 1, true) or string.find(t, "bird", 1, true) then
+                                            hasDuckKeyword = true
+                                        end
                                     end
                                 end
                             end)
-                            if (hasScore and hasCombo) or (hasNext and hasSpeed and hasBonus) then
-                                return f
-                            end
                             local ln = string.lower(f.Name or "")
-                            if (string.find(ln, "minigame", 1, true) or string.find(ln, "treadmill", 1, true) or string.find(ln, "duck", 1, true)) and (hasScore or hasNext) then
+                            local nameMatch = string.find(ln, "minigame", 1, true) or string.find(ln, "treadmill", 1, true) or string.find(ln, "duck", 1, true) or string.find(ln, "shoot", 1, true) or string.find(ln, "target", 1, true) or string.find(ln, "game", 1, true)
+                            if (hasMinigameKeyword and textCount >= 2) or nameMatch or hasDuckKeyword then
                                 return f
                             end
                         end
@@ -1620,20 +1668,25 @@ local function findDucks()
         pcall(function()
             if (d:IsA("ImageLabel") or d:IsA("ImageButton") or d:IsA("TextButton") or d:IsA("GuiButton")) and d.Visible then
                 local sz = d.AbsoluteSize
-                if sz.X >= 20 and sz.X <= 120 and sz.Y >= 20 and sz.Y <= 120 then
+                -- Ducks/targets are typically 20-200px
+                if sz.X >= 15 and sz.X <= 200 and sz.Y >= 15 and sz.Y <= 200 then
                     local n = string.lower(d.Name or "")
-                    if not (string.find(n, "tree", 1, true) or string.find(n, "cloud", 1, true) or string.find(n, "ground", 1, true) or string.find(n, "sky", 1, true) or string.find(n, "background", 1, true) or string.find(n, "back", 1, true) or string.find(n, "score", 1, true) or string.find(n, "combo", 1, true) or string.find(n, "bonus", 1, true) or string.find(n, "next", 1, true) or string.find(n, "speed", 1, true)) then
+                    -- Only exclude obvious non-duck UI elements
+                    local excluded = string.find(n, "score", 1, true) or string.find(n, "combo", 1, true) or string.find(n, "background", 1, true) or string.find(n, "backdrop", 1, true) or string.find(n, "border", 1, true) or string.find(n, "frame", 1, true) or string.find(n, "panel", 1, true)
+                    if not excluded then
                         local relY = (d.AbsolutePosition.Y - mgPos.Y) / math.max(1, mgSize.Y)
                         local relX = (d.AbsolutePosition.X - mgPos.X) / math.max(1, mgSize.X)
-                        if relY > 0.15 and relY < 0.85 and relX > 0.02 and relX < 0.98 then
-                            local isNamedDuck = string.find(n, "duck", 1, true) or string.find(n, "bird", 1, true) or string.find(n, "target", 1, true) or string.find(n, "enemy", 1, true)
+                        -- Must be inside the minigame frame bounds
+                        if relY >= 0 and relY <= 1 and relX >= 0 and relX <= 1 then
                             local last = MinigameLastPos[d]
                             local moved = false
                             if last then
-                                if (d.AbsolutePosition - last).Magnitude > 5 then moved = true end
+                                if (d.AbsolutePosition - last).Magnitude > 3 then moved = true end
                             end
                             MinigameLastPos[d] = d.AbsolutePosition
-                            if isNamedDuck or moved or (d:IsA("ImageLabel") and sz.X >= 25 and sz.X <= 70 and sz.Y >= 25 and sz.Y <= 70) then
+                            -- Include: named duck/bird/target, OR moving, OR small image (likely a sprite)
+                            local isNamed = string.find(n, "duck", 1, true) or string.find(n, "bird", 1, true) or string.find(n, "target", 1, true) or string.find(n, "enemy", 1, true) or string.find(n, "shoot", 1, true)
+                            if isNamed or moved or (d:IsA("ImageLabel") and sz.X >= 20 and sz.X <= 100 and sz.Y >= 20 and sz.Y <= 100) then
                                 table.insert(out, d)
                             end
                         end
@@ -1648,9 +1701,12 @@ local function findDucks()
     -- 3D fallback: workspace ducks with ClickDetector
     pcall(function()
         for _, m in ipairs(workspace:GetDescendants()) do
-            if m:IsA("Model") and (string.find(string.lower(m.Name or ""), "duck", 1, true) or string.find(string.lower(m.Name or ""), "bird", 1, true)) then
-                local cd = m:FindFirstChildOfClass("ClickDetector", true)
-                if cd then table.insert(uniq, { _is3D = true, model = m, detector = cd, Name = m.Name }) end
+            if m:IsA("Model") then
+                local mn = string.lower(m.Name or "")
+                if string.find(mn, "duck", 1, true) or string.find(mn, "bird", 1, true) or string.find(mn, "target", 1, true) then
+                    local cd = m:FindFirstChildOfClass("ClickDetector", true)
+                    if cd then table.insert(uniq, { _is3D = true, model = m, detector = cd, Name = m.Name }) end
+                end
             end
         end
     end)
@@ -1661,7 +1717,7 @@ local function autoTapDuck(duck)
     local key = duck
     if duck._is3D then key = duck.model end
     local now = os.clock()
-    if MinigameTapped[key] and now - MinigameTapped[key] < 0.4 then return false end
+    if MinigameTapped[key] and now - MinigameTapped[key] < 0.3 then return false end
     MinigameTapped[key] = now
     local tapped = false
     if duck._is3D then
@@ -1736,6 +1792,15 @@ local function startMinigameLoop()
         end
         MinigameLoopRunning = false
     end)
+end
+
+-- Auto-start minigame loop when AUTO_MINIGAME is enabled AND minigame GUI is detected
+local MinigameAutoStartChecked = false
+local function ensureMinigameLoop()
+    if not CONFIG.AUTO_MINIGAME then return end
+    if MinigameLoopRunning then return end
+    -- Only try to start if we can detect the minigame UI (or just start anyway so it's ready)
+    startMinigameLoop()
 end
 
 local function setAutoMinigame(on)
