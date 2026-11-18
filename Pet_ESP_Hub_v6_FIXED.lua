@@ -684,6 +684,14 @@ local function getAllPetsUniversal()
     for _, name in ipairs({"ClientPets","Pets","DownedPets","Downed","WildPets"}) do
         scanFolderForPets(workspace:FindFirstChild(name), out, seen)
     end
+    -- Zone folders: wild pets live here, e.g. workspace.World2.Zones.AmberCanyon.Spawns.Spawn_Amargasaurus_1
+    for _, zoneName in ipairs({"World1","World2"}) do
+        local worldFolder = workspace:FindFirstChild(zoneName)
+        if worldFolder then
+            local zones = worldFolder:FindFirstChild("Zones")
+            scanFolderForPets(zones, out, seen)
+        end
+    end
     -- Workspace-direct pets
     scanWorkspaceDirect(out, seen)
     -- If workspace scan found nothing, broaden the search
