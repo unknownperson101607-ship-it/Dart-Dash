@@ -603,14 +603,23 @@ local function isLikelyPet(inst)
     return false
 end
 
+-- Position-only base check (used during pet scanning - don't exclude by ownership,
+-- only by actual proximity to base. Owned pets far from base are still wild pets.)
+local function isNearBasePos(pos)
+    if not pos then return false end
+    local inBox = pos.X >= 5900 and pos.X <= 6050 and pos.Z >= 20 and pos.Z <= 180
+    local inRadius = (pos - CONFIG.BASE_POS).Magnitude < CONFIG.BASE_RADIUS
+    return inBox or inRadius
+end
+
 local function scanFolderForPets(folder, out, seen)
     if not folder then return end
     for _, child in ipairs(folder:GetChildren()) do
         pcall(function()
             if isLikelyPet(child) and not seen[child] then
-                local inBase = false
-                pcall(function() inBase = isInBase(child) end)
-                if not inBase then
+                local pos = worldPos(child)
+                local nearBase = isNearBasePos(pos)
+                if not nearBase then
                     seen[child] = true
                     table.insert(out, child)
                 end
@@ -627,9 +636,8 @@ local function scanWorkspaceDirect(out, seen)
     pcall(function()
         for _, child in ipairs(workspace:GetChildren()) do
             if isLikelyPet(child) and not seen[child] then
-                local inBase = false
-                pcall(function() inBase = isInBase(child) end)
-                if not inBase then
+                local pos = worldPos(child)
+                if not isNearBasePos(pos) then
                     seen[child] = true
                     table.insert(out, child)
                 end
@@ -644,9 +652,8 @@ local function scanReplicatedStorage(out, seen)
         if not RS then return end
         for _, child in ipairs(RS:GetDescendants()) do
             if isLikelyPet(child) and not seen[child] then
-                local inBase = false
-                pcall(function() inBase = isInBase(child) end)
-                if not inBase then
+                local pos = worldPos(child)
+                if not isNearBasePos(pos) then
                     seen[child] = true
                     table.insert(out, child)
                 end
@@ -661,9 +668,8 @@ local function scanServerStorage(out, seen)
         if not SS then return end
         for _, child in ipairs(SS:GetDescendants()) do
             if isLikelyPet(child) and not seen[child] then
-                local inBase = false
-                pcall(function() inBase = isInBase(child) end)
-                if not inBase then
+                local pos = worldPos(child)
+                if not isNearBasePos(pos) then
                     seen[child] = true
                     table.insert(out, child)
                 end
@@ -1019,7 +1025,7 @@ local function shouldShoot(pet)
     local v, on = cam:WorldToViewportPoint(aimPoint)
     if not on or v.Z <= 0 then return false end
     local cx, cy = cam.ViewportSize.X/2, cam.ViewportSize.Y/2
-    local dx, dy = v.X - cx, v.Y - cy
+    local dx, dy = math.abs(v.X - cx), math.abs(v.Y - cy)
     local dist = (aimPoint - cam.CFrame.Position).Magnitude
     -- Distance-scaled px tolerance from CONFIG (more lenient for distant/small pets)
     local tolPx = CONFIG.AIM_TOLERANCE_PX
@@ -1028,23 +1034,14 @@ local function shouldShoot(pet)
     else
         tolPx = math.clamp(CONFIG.AIM_TOLERANCE_PX + 30 - dist / 60, 50, CONFIG.AIM_TOLERANCE_PX + 30)
     end
-    -- 3D angular tolerance from CONFIG (more lenient)
-    local look = cam.CFrame.LookVector
-    local toPet = (aimPoint - cam.CFrame.Position).Unit
-    local dot = math.clamp(look:Dot(toPet), -1, 1)
-    local angleDeg = math.deg(math.acos(dot))
-    local maxAngle = isAir and CONFIG.AIR_ANGLE_DEG or CONFIG.GROUND_ANGLE_DEG
-    if angleDeg > maxAngle then
-        AirAimState.frames = 0
-        return false
-    end
-    local inTol = math.abs(dx) < tolPx and math.abs(dy) < tolPx
+    -- Pixel tolerance: crosshair within tolPx of pet on screen
+    -- AirAimState tracks consecutive frames in tolerance (aimAtPet aligns camera first)
+    local inTol = dx < tolPx and dy < tolPx
     if inTol then
         AirAimState.frames = AirAimState.frames + 1
     else
         AirAimState.frames = 0
     end
-    -- 1 consecutive frame in tolerance is enough for both air and ground
     return AirAimState.frames >= 1
 end
 local function shootPet(pet)
@@ -1458,13 +1455,31 @@ end)
 diagBtn.Activated:Connect(function()
     local pets = getAllPets()
     local downed = getDownedPets(CONFIG.WORLD_FILTER)
-    print("[PetESP v6 DIAG] Minigame open: " .. tostring(isMinigameOpen()) .. " | Ducks tapped: " .. tostring(MinigameStats.tapped) .. " | AutoMinigame: " .. tostring(CONFIG.AUTO_MINIGAME) .. " | " .. "[PetESP v6 DIAG] Wild:", #pets, "| Downed (my only):", #downed, "| World:", CONFIG.CurrentWorld, "Filter:", CONFIG.WORLD_FILTER, "| ESP:", CONFIG.ESP_MODE, "| Collect:", CONFIG.AUTO_COLLECT, "| State:", collectState)
-    print("[PetESP v6 DIAG] ESP Universal: cached "..tostring(#PET_SCAN_CACHE).." pets | If 0, pets are not in workspace - check streaming / folder")
-    print("[PetESP v6 DIAG] Base:", tostring(CONFIG.BASE_POS), "| Aim:", tostring(CONFIG.AIM_POS), "| You:", getHRP() and tostring(getHRP().Position) or "no char")
-    for i, pet in ipairs(pets) do if i > 8 then break end local info = getPetValueCached(pet) local w = getPetWorld(pet) local pos = getPetCenter(pet) local d, t = isDownedLatched(pet) print(string.format("[PetESP v6 DIAG] %s | %s - %s | W %s | smart %.0f | pos %.0f,%.0f,%.0f | Downed %s %s | InBase %s", pet.Name, tostring(info.rarity), tostring(info.display), w, getSmartScore(pet, info, (pos - CONFIG.AIM_POS).Magnitude, isAirPet(pet)), pos.X, pos.Y, pos.Z, tostring(d), tostring(t), tostring(isInBase(pet)))) pcall(function() for k,v in pairs(pet:GetAttributes()) do print("  Attr", k, "=", tostring(v)) end end) end
+    print("[PetESP v6 DIAG] ========== PET DISCOVERY DIAG ============")
+    print("[PetESP v6 DIAG] Wild pets found: " .. tostring(#pets) .. " | Cached: " .. tostring(#PET_SCAN_CACHE))
+    print("[PetESP v6 DIAG] Downed (my only): " .. tostring(#downed) .. " | World: " .. CONFIG.CurrentWorld .. " | Filter: " .. CONFIG.WORLD_FILTER)
+    print("[PetESP v6 DIAG] ESP: " .. tostring(CONFIG.ESP_MODE) .. " | Collect: " .. tostring(CONFIG.AUTO_COLLECT) .. " | Aim: " .. tostring(CONFIG.AUTO_AIM) .. " | State: " .. collectState)
+    print("[PetESP v6 DIAG] Base: " .. tostring(CONFIG.BASE_POS) .. " | Aim: " .. tostring(CONFIG.AIM_POS) .. " | You: " .. (getHRP() and tostring(getHRP().Position) or "no char"))
+    -- Show where pets were found (scan location breakdown)
+    local foundByLoc = {}
+    for _, pet in ipairs(pets) do
+        local pth = pet:GetFullName()
+        local loc = "unknown"
+        if pth:find("World2%.Zones") then loc = "World2.Zones"
+        elseif pth:find("World1%.Zones") then loc = "World1.Zones"
+        elseif pth:find("ClientPets") then loc = "ClientPets"
+        elseif pth:find("^workspace%.") then loc = "workspace-direct"
+        elseif pth:find("ReplicatedStorage") then loc = "ReplicatedStorage"
+        elseif pth:find("ServerStorage") then loc = "ServerStorage"
+        else loc = "other: " .. pth:sub(1,40) end
+        foundByLoc[loc] = (foundByLoc[loc] or 0) + 1
+    end
+    for loc, cnt in pairs(foundByLoc) do print("[PetESP v6 DIAG]   " .. loc .. ": " .. tostring(cnt) .. " pets") end
+    print("[PetESP v6 DIAG] ------------------------------------------------")
+    for i, pet in ipairs(pets) do if i > 8 then break end local info = getPetValueCached(pet) local w = getPetWorld(pet) local pos = getPetCenter(pet) local d, t = isDownedLatched(pet) print(string.format("[PetESP v6 DIAG] %s | %s - %s | W %s | smart %.0f | pos %.0f,%.0f,%.0f | Downed %s %s | InBase %s | FullName: %s", pet.Name, tostring(info.rarity), tostring(info.display), w, getSmartScore(pet, info, (pos - CONFIG.AIM_POS).Magnitude, isAirPet(pet)), pos.X, pos.Y, pos.Z, tostring(d), tostring(t), tostring(isInBase(pet)), pet:GetFullName())) pcall(function() for k,v in pairs(pet:GetAttributes()) do print("  Attr", k, "=", tostring(v)) end end) end
     for _, e in ipairs(downed) do print("[PetESP v6 DIAG] DOWNED (mine):", e.pet.Name, e.info.display, "timer", e.timer, "latched", tostring(e.latched), "dist", math.floor(e.dist)) end
     local tp, ti = getTopPetSmart(CONFIG.WORLD_FILTER)
-    if tp then print("[PetESP v6 DIAG] TOP SMART:", tp.Name, ti.rarity, ti.display, "World", getPetWorld(tp)) setStatus("DIAG: TOP "..tp.Name:sub(1,18).." ("..tostring(ti.display)..") | Downed "..#downed.." - F9", "info") else print("[PetESP v6 DIAG] TOP: none") setStatus("DIAG: no wild pets - try other World (Normal/Prehistoric)", "err") end
+    if tp then print("[PetESP v6 DIAG] TOP SMART:", tp.Name, ti.rarity, ti.display, "World", getPetWorld(tp), "FullName:", tp:GetFullName()) setStatus("DIAG: TOP "..tp.Name:sub(1,18).." ("..tostring(ti.display)..") | Downed "..#downed.." - F9", "info") else print("[PetESP v6 DIAG] TOP: none") setStatus("DIAG: no wild pets - try other World (Normal/Prehistoric)", "err") end
 end)
 saveConfigBtn.Activated:Connect(function() setStatus("Config saved: "..configNameBox.Text, "ok") end)
 resetLayoutBtn.Activated:Connect(function() main.Position = UDim2.new(0.5,-270,0.5,-180) setStatus("Layout reset", "info") end)
@@ -1509,19 +1524,14 @@ local function aimAtPet(pet)
     if not aimPoint then return false end
     local v, on = cam:WorldToViewportPoint(aimPoint)
     if not on or v.Z <= 0 then return false end
-    -- PRIMARY: VIM mouse move (game scoped camera follows mouse, works even when scoped)
-    local okVIM = pcall(function()
+    -- PRIMARY: instant camera CFrame alignment (aims immediately when not scoped)
+    local okCam = pcall(function() cam.CFrame = CFrame.lookAt(cam.CFrame.Position, aimPoint) end)
+    -- SECONDARY: VIM mouse move (works when scoped - game follows mouse)
+    pcall(function()
         local VIM = game:GetService("VirtualInputManager")
         VIM:SendMouseMoveEvent(v.X, v.Y, game)
     end)
-    -- FALLBACK: only set camera CFrame when NOT scoped (scoped camera overrides CFrame every frame)
-    local fov = 70
-    pcall(function() fov = cam.FieldOfView end)
-    local isScoped = fov < 40
-    if not isScoped then
-        pcall(function() cam.CFrame = CFrame.lookAt(cam.CFrame.Position, aimPoint) end)
-    end
-    return okVIM
+    return okCam
 end
 
 local function shootPet(pet)
