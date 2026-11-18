@@ -34,22 +34,26 @@ local CONFIG = {
     ESP_MODE = "TOP", -- "TOP" (Top15+Downed+Near10), "ALL", "DOWNED"
     AUTO_AIM = false,
     AUTO_COLLECT = false,
+    AUTO_MINIGAME = false,
     WORLD_FILTER = "Both",
-    ESP_REFRESH = 0.5,
-    AIM_COOLDOWN = 0.12,
-    SHOOT_COOLDOWN = 0.8,
-    MAX_ESP = 35, -- TOP 15 + Downed + Near 10 = max ~35, never 163 blocking screen
-    COLLECT_COOLDOWN = 2.0,
+    ESP_REFRESH = 0.3,
+    AIM_COOLDOWN = 0.05,
+    SHOOT_COOLDOWN = 0.6,
+    MAX_ESP = 35, -- TOP 15 + Downed + Near 10 = max ~35, never 163
+    COLLECT_COOLDOWN = 1.5,
     MY_DOWNED_ONLY = true,
     CurrentWorld = "Prehistoric",
     SMART_SCORE = true,
     STICKY_TARGET = true,
     ANTI_STEAL_RADIUS = 30,
-    VALUE_CACHE_TTL = 1.5,
+    VALUE_CACHE_TTL = 1.0,
     SHOT_VERIFY_TIME = 5,
     AIR_LEAD_DIV = 1200,
     AIR_MAX_LEAD = 0.8,
     LATCH_TTL = 120,
+    AIM_TOLERANCE_PX = 70,
+    AIR_ANGLE_DEG = 2.5,
+    GROUND_ANGLE_DEG = 2.0,
 }
 
 local Players = game:GetService("Players")
@@ -157,21 +161,19 @@ local function isOwnedByMe(pet)
     end
     local ok2, own = pcall(function() return pet:GetAttribute("Owner") or pet:GetAttribute("OwnerName") or pet:GetAttribute("OwnerId") end)
     if ok2 and own ~= nil then return tostring(own) == player.Name or tostring(own) == tostring(player.UserId) end
-    local a = pet.Parent
-    while a and a ~= workspace do
-        local n = a.Name:lower()
-        if n:find("base") or n:find("owned") or n:find("mypets") or n:find("my pets") then return true end
-        a = a.Parent
-    end
     return false
 end
 local function isInBase(pet)
     if isOwnedByMe(pet) then return true end
-    local pos = worldPos(pet)
+    local pos = nil
+    pcall(function() pos = worldPos(pet) end)
     if not pos then return false end
-    if (pos - CONFIG.BASE_POS).Magnitude < CONFIG.BASE_RADIUS then return true end
-    -- Base box: X 5900-6050, Z 20-180 (covers base in Pic1, aim spot 5973,3,2 is OUTSIDE base, Z=2)
-    if pos.X >= 5900 and pos.X <= 6050 and pos.Z >= 20 and pos.Z <= 180 then return true end
+    local inBox = pos.X >= 5900 and pos.X <= 6050 and pos.Z >= 20 and pos.Z <= 180
+    local inRadius = (pos - CONFIG.BASE_POS).Magnitude < CONFIG.BASE_RADIUS
+    if not (inBox or inRadius) then return false end
+    -- Inside base area: only exclude if owned by you, OR deep inside the base box
+    if isOwnedByMe(pet) then return true end
+    if inBox then return true end
     return false
 end
 
@@ -581,57 +583,96 @@ local function getPetValue(pet)
 end
 
 -- v2: scan ClientPets + Pets + DownedPets + Downed + WildPets + workspace direct (filtered by Value/Rarity), dedupe, EXCLUDE base pets
-local function getAllPets()
-    local out = {}
-    local seen = {}
-    local function tryAdd(inst)
-        if not inst or seen[inst] then return end
-        -- Must have a BasePart somewhere
-        local hasPart = false
+local PET_SCAN_CACHE = {}
+local PET_SCAN_CACHE_AT = 0
+local PET_SCAN_CACHE_TTL = 0.4
+
+local function scanFolderForPets(folder, out, seen)
+    if not folder then return end
+    for _, child in ipairs(folder:GetChildren()) do
         pcall(function()
-            if inst:IsA("BasePart") then hasPart = true
-            elseif inst:IsA("Model") or inst:IsA("Folder") then hasPart = inst:FindFirstChildWhichIsA("BasePart", true) ~= nil end
-        end)
-        if not hasPart then return end
-        -- Exclude player characters
-        if Players:GetPlayerFromCharacter(inst) then return end
-        -- Exclude base / owned pets - Pic1 fix
-        local inBase = false
-        pcall(function() inBase = isInBase(inst) end)
-        if inBase then return end
-        seen[inst] = true
-        table.insert(out, inst)
-    end
-    local function scanFolder(folder, strict)
-        if not folder then return end
-        for _, child in ipairs(folder:GetChildren()) do
-            pcall(function()
-                if child:IsA("Model") or child:IsA("Folder") or child:IsA("BasePart") then
-                    if strict then
-                        -- Workspace-direct: only if it looks like a pet (has Value/Rarity attr or Value child) - avoids scanning every part in map
-                        local looksPet = child:GetAttribute("Value") or child:GetAttribute("Rarity") or child:GetAttribute("Income") or child:FindFirstChild("Value")
-                        if looksPet then tryAdd(child) end
-                    else
-                        tryAdd(child)
+            if child:IsA("Model") or child:IsA("Folder") or child:IsA("BasePart") then
+                if not seen[child] then
+                    local hasPart = false
+                    pcall(function()
+                        if child:IsA("BasePart") then hasPart = true
+                        elseif child:IsA("Model") or child:IsA("Folder") then hasPart = child:FindFirstChildWhichIsA("BasePart", true) ~= nil end
+                    end)
+                    if not hasPart then return end
+                    if Players:GetPlayerFromCharacter(child) then return end
+                    local inBase = false
+                    pcall(function() inBase = isInBase(child) end)
+                    if inBase then return end
+                    seen[child] = true
+                    table.insert(out, child)
+                end
+                -- Recurse one level into subfolders (World1/World2)
+                if child:IsA("Folder") then
+                    for _, sub in ipairs(child:GetChildren()) do
+                        pcall(function()
+                            if (sub:IsA("Model") or sub:IsA("BasePart")) and not seen[sub] then
+                                local hasPart2 = false
+                                pcall(function()
+                                    if sub:IsA("BasePart") then hasPart2 = true
+                                    elseif sub:IsA("Model") then hasPart2 = sub:FindFirstChildWhichIsA("BasePart", true) ~= nil end
+                                end)
+                                if not hasPart2 then return end
+                                if Players:GetPlayerFromCharacter(sub) then return end
+                                local inBase2 = false
+                                pcall(function() inBase2 = isInBase(sub) end)
+                                if inBase2 then return end
+                                seen[sub] = true
+                                table.insert(out, sub)
+                            end
+                        end)
                     end
                 end
-            end)
-        end
-        -- Also recurse one level for World1/World2 subfolders
-        for _, child in ipairs(folder:GetChildren()) do
-            if child:IsA("Folder") then
-                for _, sub in ipairs(child:GetChildren()) do
-                    pcall(function() if sub:IsA("Model") or sub:IsA("BasePart") then tryAdd(sub) end end)
+            end
+        end)
+    end
+end
+
+local function getAllPetsUniversal()
+    local now = os.clock()
+    if PET_SCAN_CACHE and PET_SCAN_CACHE_AT and now - PET_SCAN_CACHE_AT < PET_SCAN_CACHE_TTL and #PET_SCAN_CACHE > 0 then
+        return PET_SCAN_CACHE
+    end
+    PET_SCAN_CACHE_AT = now
+    local out = {}
+    local seen = {}
+    -- Known pet folders
+    for _, name in ipairs({"ClientPets","Pets","DownedPets","Downed","WildPets"}) do
+        scanFolderForPets(workspace:FindFirstChild(name), out, seen)
+    end
+    -- Workspace-direct pets (downed pets often reparented to workspace) - strict filter
+    pcall(function()
+        for _, child in ipairs(workspace:GetChildren()) do
+            if (child:IsA("Model") or child:IsA("BasePart")) and not seen[child] then
+                local looksPet = child:GetAttribute("Value") or child:GetAttribute("Rarity") or child:GetAttribute("Income") or child:GetAttribute("PetId") or child:GetAttribute("Pet") or child:FindFirstChild("Value")
+                if looksPet then
+                    local hasPart = false
+                    pcall(function()
+                        if child:IsA("BasePart") then hasPart = true
+                        elseif child:IsA("Model") then hasPart = child:FindFirstChildWhichIsA("BasePart", true) ~= nil end
+                    end)
+                    if hasPart and not Players:GetPlayerFromCharacter(child) then
+                        local inBase = false
+                        pcall(function() inBase = isInBase(child) end)
+                        if not inBase then
+                            seen[child] = true
+                            table.insert(out, child)
+                        end
+                    end
                 end
             end
         end
-    end
-    for _, name in ipairs({"ClientPets","Pets","DownedPets","Downed","WildPets"}) do
-        scanFolder(workspace:FindFirstChild(name), false)
-    end
-    -- Workspace-direct pets (downed pets often reparented to workspace) - strict filter
-    scanFolder(workspace, true)
+    end)
+    PET_SCAN_CACHE = out
     return out
+end
+
+local function getAllPets()
+    return getAllPetsUniversal()
 end
 
 local function getTopPet(filter)
@@ -931,19 +972,19 @@ local function shouldShoot(pet)
     local cx, cy = cam.ViewportSize.X/2, cam.ViewportSize.Y/2
     local dx, dy = v.X - cx, v.Y - cy
     local dist = (aimPoint - cam.CFrame.Position).Magnitude
-    -- Distance-scaled px tolerance: far = larger (up to 120), close = tighter (30)
-    local tolPx = 60
+    -- Distance-scaled px tolerance from CONFIG
+    local tolPx = CONFIG.AIM_TOLERANCE_PX
     if isAir then
-        tolPx = math.clamp(120 - dist / 50, 35, 120)
+        tolPx = math.clamp(CONFIG.AIM_TOLERANCE_PX + 50 - dist / 50, 35, CONFIG.AIM_TOLERANCE_PX + 50)
     else
-        tolPx = math.clamp(90 - dist / 80, 40, 90)
+        tolPx = math.clamp(CONFIG.AIM_TOLERANCE_PX + 20 - dist / 80, 40, CONFIG.AIM_TOLERANCE_PX + 20)
     end
-    -- Also check 3D angular tolerance: angle between camera look and vector to pet < 2 deg for air, 1.5 deg ground
+    -- Also check 3D angular tolerance from CONFIG
     local look = cam.CFrame.LookVector
     local toPet = (aimPoint - cam.CFrame.Position).Unit
     local dot = math.clamp(look:Dot(toPet), -1, 1)
     local angleDeg = math.deg(math.acos(dot))
-    local maxAngle = isAir and 2.2 or 1.8
+    local maxAngle = isAir and CONFIG.AIR_ANGLE_DEG or CONFIG.GROUND_ANGLE_DEG
     if angleDeg > maxAngle then
         AirAimState.frames = 0
         return false
@@ -1023,7 +1064,7 @@ local function autoAimTick()
         task.wait(0.08)
         aimAtPetFixed(topPet, true)
         if topLabel then topLabel.Text = "⭐ TOP: "..tostring(topPet.Name):sub(1,20).." | "..tostring(info.rarity).." • "..tostring(info.display).." | "..getPetWorld(topPet).." | "..tostring(distAim).." studs (aim)" end
-        if lastTarget ~= topPet then lastTarget = topPet AirAimState.frames = 0 setStatus("🎯 Aiming TOP: "..tostring(topPet.Name):sub(1,18).." ("..tostring(info.display)..") - aligning...", "warn") end
+        if lastTarget ~= topPet then lastTarget = topPet; AirAimState.frames = 0; setStatus("🎯 Aiming TOP: "..tostring(topPet.Name):sub(1,18).." ("..tostring(info.display)..") - aligning...", "warn") end
         -- Only shoot if crosshair is on pet
         if shouldShoot(topPet) then shootPet(topPet) end
     end
@@ -1113,228 +1154,11 @@ local function autoCollectTick()
     end
 end
 
---------------------------------------------------------------------------------
--- V5 AUTO MINIGAME LOGIC - treadmill duck auto-tap
+------ V5/V6 AUTO MINIGAME LOGIC - treadmill duck auto-tap
 CONFIG.AUTO_MINIGAME = false
 MinigameStats = { tapped = 0, lastTapAt = 0, lastDuckName = "" }
 MinigameTapped = {} -- instance -> last tap time
-MinigameLoopToken = 0
-MINIGAME_EXCLUDE = { "back", "close", "shoot", "tree", "cloud", "grass", "sky", "ground", "background", "frame", "score", "combo", "bonus", "next", "speed", "button" }
-MINIGAME_DUCK_KEYS = { "duck", "bird", "target", "enemy", "flying", "ptero", "rhampho" }
-function _lower(s) return string.lower(tostring(s or "")) end
-function _has(s, pat) return string.find(_lower(s), pat, 1, true) ~= nil end
-function _isExcluded(name)
-    local n = _lower(name)
-    for _, ex in ipairs(MINIGAME_EXCLUDE) do if _has(n, ex) then return true end end
-    return false
-end
-function _isDuckName(name)
-    local n = _lower(name)
-    for _, k in ipairs(MINIGAME_DUCK_KEYS) do if _has(n, k) then return true end end
-    return false
-end
-function findMinigameGui()
-    local guis = {}
-    pcall(function() table.insert(guis, playerGui) end)
-    pcall(function() local h = hostFor() if h then table.insert(guis, h) end end)
-    -- Also check CoreGui via game service
-    pcall(function() table.insert(guis, game:GetService("CoreGui")) end)
-    for _, root in ipairs(guis) do
-        if root then
-            local ok, desc = pcall(function() return root:GetDescendants() end)
-            if ok and desc then
-                for _, f in ipairs(desc) do
-                    if f:IsA("Frame") and f.Visible then
-                        local hasScore, hasCombo = false, false
-                        pcall(function()
-                            for _, d in ipairs(f:GetDescendants()) do
-                                if d:IsA("TextLabel") then
-                                    if _has(d.Text, "score") then hasScore = true end
-                                    if _has(d.Text, "combo") then hasCombo = true end
-                                end
-                            end
-                        end)
-                        if hasScore and hasCombo then return f end
-                        -- Also: Frame named MiniGame / Treadmill / DuckGame with visible ducks
-                        if _has(f.Name, "minigame") or _has(f.Name, "treadmill") or _has(f.Name, "duckgame") then
-                            if f.Visible then return f end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return nil
-end
-function isMinigameOpen() return findMinigameGui() ~= nil end
-function findDucks()
-    local out = {}
-    local mg = findMinigameGui()
-    if mg then
-        local ok, desc = pcall(function() return mg:GetDescendants() end)
-        if ok and desc then
-            for _, d in ipairs(desc) do
-                local n = d.Name or ""
-                if _isExcluded(n) then
-                    -- skip BACK, tree, cloud etc
-                elseif d:IsA("ImageButton") and d.Visible then
-                    -- ImageButton inside minigame = very likely duck / target. Exclude if huge (background)
-                    local sz = d.AbsoluteSize
-                    if sz.X >= 20 and sz.X <= 120 and sz.Y >= 20 and sz.Y <= 120 then
-                        table.insert(out, d)
-                    elseif _isDuckName(n) then
-                        table.insert(out, d)
-                    end
-                elseif d:IsA("TextButton") and d.Visible and _isDuckName(n) then
-                    table.insert(out, d)
-                elseif d:IsA("ImageLabel") and d.Visible and _isDuckName(n) then
-                    table.insert(out, d)
-                elseif d:IsA("GuiButton") and d.Visible then
-                    local sz = d.AbsoluteSize
-                    if sz.X >= 30 and sz.X <= 90 and sz.Y >= 30 and sz.Y <= 90 and not _isExcluded(n) then
-                        -- Generic small button inside minigame - could be duck if not BACK
-                        if _isDuckName(n) or true then
-                            -- Only add if it looks like duck: check if parent is minigame canvas, not top bar
-                            table.insert(out, d)
-                        end
-                    end
-                end
-            end
-        end
-        -- Dedupe: same instance may appear twice via GuiButton + ImageButton check, keep unique
-        local seen = {}
-        local uniq = {}
-        for _, d in ipairs(out) do if not seen[d] then seen[d] = true table.insert(uniq, d) end end
-        out = uniq
-    end
-    -- 3D fallback: workspace ducks with ClickDetector
-    pcall(function()
-        for _, m in ipairs(workspace:GetDescendants()) do
-            if m:IsA("Model") and _isDuckName(m.Name) then
-                local cd = m:FindFirstChildOfClass("ClickDetector", true)
-                if cd then table.insert(out, { _is3D = true, model = m, detector = cd, Name = m.Name }) end
-            end
-        end
-    end)
-    return out, mg
-end
-function autoTapDuck(duck)
-    -- Dedupe 0.5s per instance
-    local key = duck
-    if duck._is3D then key = duck.model end
-    local now = os.clock()
-    if MinigameTapped[key] and now - MinigameTapped[key] < 0.5 then return false end
-    MinigameTapped[key] = now
-    local tapped = false
-    -- 3D duck
-    if duck._is3D then
-        pcall(function()
-            if fireclickdetector then fireclickdetector(duck.detector) tapped = true end
-        end)
-        if tapped then
-            MinigameStats.tapped = MinigameStats.tapped + 1
-            MinigameStats.lastTapAt = now
-            MinigameStats.lastDuckName = tostring(duck.Name)
-            return true
-        end
-        -- Fallback: VIM click at world position
-        pcall(function()
-            local cam = workspace.CurrentCamera
-            local pos = duck.model:GetPivot().Position
-            local v, on = cam:WorldToViewportPoint(pos)
-            if on then
-                local VIM = game:GetService("VirtualInputManager")
-                VIM:SendMouseMoveEvent(v.X, v.Y, game)
-                VIM:SendMouseButtonEvent(v.X, v.Y, 0, true, game)
-                task.wait(0.03)
-                VIM:SendMouseButtonEvent(v.X, v.Y, 0, false, game)
-                tapped = true
-            end
-        end)
-        if tapped then MinigameStats.tapped = MinigameStats.tapped + 1 MinigameStats.lastTapAt = now MinigameStats.lastDuckName = tostring(duck.Name) end
-        return tapped
-    end
-    -- GUI duck: try Activate first (GuiButton)
-    pcall(function()
-        if duck:IsA("GuiButton") then
-            duck:Activate()
-            tapped = true
-        end
-    end)
-    -- VIM click at center - most reliable for ImageLabel / ImageButton minigames that use InputBegan
-    pcall(function()
-        local VIM = game:GetService("VirtualInputManager")
-        local pos = duck.AbsolutePosition
-        local sz = duck.AbsoluteSize
-        local cx, cy = pos.X + sz.X / 2, pos.Y + sz.Y / 2
-        VIM:SendMouseMoveEvent(cx, cy, game)
-        task.wait(0.01)
-        VIM:SendMouseButtonEvent(cx, cy, 0, true, game)
-        task.wait(0.03)
-        VIM:SendMouseButtonEvent(cx, cy, 0, false, game)
-        tapped = true
-    end)
-    -- Remote fallback: only if still not tapped and duck has remote-like name, try Duck remotes
-    if not tapped then
-        pcall(function()
-            local RS = game:GetService("ReplicatedStorage")
-            for _, d in ipairs(RS:GetDescendants()) do
-                if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
-                    local rn = _lower(d.Name)
-                    if _has(rn, "duck") or _has(rn, "minigame") or _has(rn, "treadmill") then
-                        if d:IsA("RemoteEvent") then d:FireServer(duck) else d:InvokeServer(duck) end
-                        tapped = true
-                        break
-                    end
-                end
-            end
-        end)
-    end
-    if tapped then
-        MinigameStats.tapped = MinigameStats.tapped + 1
-        MinigameStats.lastTapAt = now
-        MinigameStats.lastDuckName = tostring(duck.Name or "Duck")
-    end
-    return tapped
-end
-function minigameTick()
-    if not CONFIG.AUTO_MINIGAME then return 0 end
-    local mg = findMinigameGui()
-    if not mg then return 0 end
-    local ducks = findDucks()
-    local tappedNow = 0
-    for _, d in ipairs(ducks) do
-        if autoTapDuck(d) then tappedNow = tappedNow + 1 end
-    end
-    if tappedNow > 0 then
-        setStatus("DUCK tapped x" .. tostring(MinigameStats.tapped) .. " (+" .. tostring(tappedNow) .. " this tick)", "ok")
-    end
-    return tappedNow
-end
-function startMinigameLoop()
-    MinigameLoopToken = MinigameLoopToken + 1
-    local myToken = MinigameLoopToken
-    task.spawn(function()
-        while CONFIG.AUTO_MINIGAME and MinigameLoopToken == myToken do
-            local ok, err = pcall(function() minigameTick() end)
-            if not ok then print("[PetESP v6] minigameTick err:", err) end
-            task.wait(0.08)
-        end
-    end)
-end
-function setAutoMinigame(on)
-    CONFIG.AUTO_MINIGAME = on
-    if on then
-        MinigameStats.tapped = 0
-        setStatus("AUTO MINIGAME ON - tapping ducks on treadmill...", "ok")
-        startMinigameLoop()
-    else
-        MinigameLoopToken = MinigameLoopToken + 1
-        setStatus("AUTO MINIGAME OFF - tapped " .. tostring(MinigameStats.tapped) .. " ducks", "warn")
-    end
-    if refreshUI then refreshUI() end
-    showPill()
-end
+
 
 -- GUI v6 CM HUB STYLE
 C = {
@@ -1590,7 +1414,7 @@ diagBtn.Activated:Connect(function()
     local pets = getAllPets()
     local downed = getDownedPets(CONFIG.WORLD_FILTER)
     print("[PetESP v6 DIAG] Minigame open: " .. tostring(isMinigameOpen()) .. " | Ducks tapped: " .. tostring(MinigameStats.tapped) .. " | AutoMinigame: " .. tostring(CONFIG.AUTO_MINIGAME) .. " | " .. "[PetESP v6 DIAG] Wild:", #pets, "| Downed (my only):", #downed, "| World:", CONFIG.CurrentWorld, "Filter:", CONFIG.WORLD_FILTER, "| ESP:", CONFIG.ESP_MODE, "| Collect:", CONFIG.AUTO_COLLECT, "| State:", collectState)
-    print("[PetESP v6 DIAG] ESP Universal: scanned "..tostring(ESP_DEBUG.scannedModels).." models, candidates "..tostring(ESP_DEBUG.petCandidates).." | If 0, pets are not in workspace - check streaming / folder")
+    print("[PetESP v6 DIAG] ESP Universal: cached "..tostring(#PET_SCAN_CACHE).." pets | If 0, pets are not in workspace - check streaming / folder")
     print("[PetESP v6 DIAG] Base:", tostring(CONFIG.BASE_POS), "| Aim:", tostring(CONFIG.AIM_POS), "| You:", getHRP() and tostring(getHRP().Position) or "no char")
     for i, pet in ipairs(pets) do if i > 8 then break end local info = getPetValueCached(pet) local w = getPetWorld(pet) local pos = getPetCenter(pet) local d, t = isDownedLatched(pet) print(string.format("[PetESP v6 DIAG] %s | %s - %s | W %s | smart %.0f | pos %.0f,%.0f,%.0f | Downed %s %s | InBase %s", pet.Name, tostring(info.rarity), tostring(info.display), w, getSmartScore(pet, info, (pos - CONFIG.AIM_POS).Magnitude, isAirPet(pet)), pos.X, pos.Y, pos.Z, tostring(d), tostring(t), tostring(isInBase(pet)))) pcall(function() for k,v in pairs(pet:GetAttributes()) do print("  Attr", k, "=", tostring(v)) end end) end
     for _, e in ipairs(downed) do print("[PetESP v6 DIAG] DOWNED (mine):", e.pet.Name, e.info.display, "timer", e.timer, "latched", tostring(e.latched), "dist", math.floor(e.dist)) end
@@ -1606,130 +1430,18 @@ UIS.InputBegan:Connect(function(input, processed) if processed then return end i
 setTab("MAIN")
 
 
--- ===== V6 FIXES =====
--- V6 FIX 1: UNIVERSAL ESP - scan ALL workspace Models by Billboard / attributes / name, not just ClientPets
--- This replaces the strict getAllPets + isInBase logic. Call getAllPetsUniversal() from getAllPets wrapper below.
-ESP_DEBUG = { scannedModels = 0, petCandidates = 0, lastScanAt = 0 }
-ESP_RARITIES = { "common", "uncommon", "rare", "epic", "legendary", "mythic", "secret", "divine" }
-ESP_PET_NAMES = { "diplo", "rhampho", "ptero", "dino", "dragon", "unicorn", "cat", "dog", "fox", "wolf", "bear", "bunny", "penguin", "axolotl", "rex", "raptor", "tricera", "stego", "bronto", "pter", "mammoth", "sabre", "egg" }
-function espHasRarityLabel(model)
-    local found = false
-    pcall(function()
-        for _, d in ipairs(model:GetDescendants()) do
-            if d:IsA("TextLabel") or d:IsA("TextButton") then
-                local t = string.lower(tostring(d.Text or ""))
-                if t ~= "" then
-                    for _, r in ipairs(ESP_RARITIES) do if string.find(t, r, 1, true) then found = true return end end
-                    if string.find(t, "/5", 1, true) or string.find(t, "/s", 1, true) or string.find(t, "qa", 1, true) or string.find(t, "to catch", 1, true) or string.find(t, "sleep", 1, true) then found = true return end
-                end
-            end
-            if d:IsA("BillboardGui") then found = true end
-        end
-    end)
-    return found
-end
-function espLooksLikePet(model)
-    if not model or not model.Parent then return false end
-    if not (model:IsA("Model") or model:IsA("Folder")) then return false end
-    if Players:GetPlayerFromCharacter(model) then return false end
-    -- Must have a part
-    local hasPart = false
-    pcall(function() hasPart = model:FindFirstChildWhichIsA("BasePart", true) ~= nil end)
-    if not hasPart then return false end
-    -- Skip map / base structures: huge parts, no Billboard, name is Part / Union / Mesh
-    local n = string.lower(model.Name or "")
-    if n == "base" or n == "terrain" or n == "workspace" or n == "map" or n:find("spawn") and not espHasRarityLabel(model) then
-        -- fallthrough, still check label
-    end
-    -- 1) Has Value/Rarity/Income/PetId attribute
-    local okA, hasAttr = pcall(function() return model:GetAttribute("Value") ~= nil or model:GetAttribute("Rarity") ~= nil or model:GetAttribute("Income") ~= nil or model:GetAttribute("PetId") ~= nil or model:GetAttribute("Pet") ~= nil end)
-    if okA and hasAttr then return true end
-    -- 2) Has Value child
-    if model:FindFirstChild("Value") then return true end
-    -- 3) Has Billboard / rarity label (this is what video shows: EPIC 3.9QA/5)
-    if espHasRarityLabel(model) then return true end
-    -- 4) Name matches pet list
-    for _, pn in ipairs(ESP_PET_NAMES) do if string.find(n, pn, 1, true) then return true end end
-    -- 5) In a known pet folder - ancestor name contains Pets / Wild / Mobs / Animals / Spawned / Live
-    local anc = model.Parent
-    while anc and anc ~= workspace do
-        local an = string.lower(anc.Name or "")
-        if an:find("clientpets") or an:find("wildpets") or an:find("wild") or an == "pets" or an:find("mobs") or an:find("animals") or an:find("spawned") or an:find("live") or an:find("downed") then
-            -- Only if it has HumanoidRootPart or PrimaryPart (to avoid folders)
-            if model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart then return true end
-        end
-        anc = anc.Parent
-    end
-    return false
-end
-function isInBaseV6(pet)
-    -- V6: Only exclude if REALLY in base: Owner==you OR ancestor is Base/Owned/MyPets AND within base radius/box.
-    -- Old code excluded any pet whose ancestor name contained base, even if far. Now require BOTH owner + distance.
-    local pos = nil
-    pcall(function() pos = worldPos(pet) end)
-    if not pos then return false end
-    local inBox = pos.X >= 5900 and pos.X <= 6050 and pos.Z >= 20 and pos.Z <= 180
-    local inRadius = (pos - CONFIG.BASE_POS).Magnitude < CONFIG.BASE_RADIUS
-    if not (inBox or inRadius) then return false end
-    -- Inside base area: check owner
-    if isOwnedByMe(pet) then return true end
-    -- If inside base box but NOT owned (wild pet wandered into base area), still exclude - it's inside base walls
-    if inBox then return true end
-    return false
-end
--- Universal scan with 1s cache
-ESP_Cache = {}
-ESP_CacheAt = 0
-function getAllPetsUniversal()
-    if os.clock() - ESP_CacheAt < 1 then return ESP_Cache end
-    ESP_CacheAt = os.clock()
-    local out = {}
-    local seen = {}
-    local totalModels = 0
-    local candidates = 0
-    local ok, all = pcall(function() return workspace:GetDescendants() end)
-    if not ok or not all then return ESP_Cache end
-    for _, v in ipairs(all) do
-        if v:IsA("Model") or v:IsA("Folder") then
-            totalModels = totalModels + 1
-            local isPet = false
-            pcall(function() isPet = espLooksLikePet(v) end)
-            if isPet then
-                candidates = candidates + 1
-                -- Avoid double-count: if parent is also a pet Model, keep child only if parent is folder, else keep parent
-                if not seen[v] then
-                    local inBase = false
-                    pcall(function() inBase = isInBaseV6(v) end)
-                    if not inBase then
-                        seen[v] = true
-                        table.insert(out, v)
-                    end
-                end
-            end
-        end
-    end
-    ESP_DEBUG.scannedModels = totalModels
-    ESP_DEBUG.petCandidates = candidates
-    ESP_DEBUG.lastScanAt = os.clock()
-    ESP_Cache = out
-    return out
-end
--- Patch: make getAllPets use universal when universal finds more, else fallback to old
--- We keep old getAllPets as getAllPetsOld (captured via _G in splice), then override
--- This function is called from splice: getAllPets = getAllPetsUniversal (with fallback)
+-- ===== UNIFIED AIM + SHOOT =====
+-- Camera CFrame lookAt is primary (works even when scoped), VIM mouse move as backup
 
--- V6 FIX 2: AIM + SHOOT - camera CFrame always, SHOOT button with ammo check
--- Replaces aimAtPetFixed + shootPet logic. Uses Camera.CFrame even when scoped (mobile crosshair is center-locked, VIM mouse move does nothing).
-function findShootButtonV6()
+local function findShootButton()
     local found = nil
-    function scanGui(root)
+    local function scanGui(root)
         if not root then return end
         local ok, desc = pcall(function() return root:GetDescendants() end)
         if not ok or not desc then return end
         for _, d in ipairs(desc) do
             if d:IsA("TextButton") or d:IsA("ImageButton") then
-                local txt = ""
-                pcall(function() txt = tostring(d.Text or "") end)
+                local txt = "" pcall(function() txt = tostring(d.Text or "") end)
                 local nm = d.Name or ""
                 if string.find(string.upper(txt), "SHOOT", 1, true) or string.find(string.upper(nm), "SHOOT", 1, true) then
                     if d.Visible and d.AbsoluteSize.X > 10 then found = d return end
@@ -1741,36 +1453,35 @@ function findShootButtonV6()
     if not found then pcall(function() scanGui(game:GetService("CoreGui")) end) end
     return found
 end
-function aimAtPetV6(pet)
+
+local function aimAtPet(pet)
     if not pet or not pet.Parent then return false end
     local cam = workspace.CurrentCamera
     if not cam then return false end
     local aimPoint = nil
-    local okAP = pcall(function() aimPoint = getAimPoint(pet, cam.CFrame.Position) end)
-    if not okAP or not aimPoint then
-        pcall(function() aimPoint = getPetCenter(pet) end)
-    end
+    pcall(function() aimPoint = getAimPoint(pet, cam.CFrame.Position) end)
+    if not aimPoint then pcall(function() aimPoint = getPetCenter(pet) end) end
     if not aimPoint then return false end
-    -- PRIMARY: Camera CFrame lookAt - works on mobile, even when scoped. Game may override CFrame, so also send VIM.
     local okCam = pcall(function() cam.CFrame = CFrame.lookAt(cam.CFrame.Position, aimPoint) end)
     pcall(function()
-        VIM = game:GetService("VirtualInputManager")
+        local VIM = game:GetService("VirtualInputManager")
         local v, on = cam:WorldToViewportPoint(aimPoint)
         if on then VIM:SendMouseMoveEvent(v.X, v.Y, game) end
     end)
     return okCam
 end
-function shootPetV6(pet)
+
+local function shootPet(pet)
     if os.clock() - lastShotAt < CONFIG.SHOOT_COOLDOWN then return false end
     if not shouldShoot(pet) then
-        aimAtPetV6(pet)
+        aimAtPet(pet)
         return false
     end
     lastShotAt = os.clock()
     recordShot(pet)
     local shot = false
-    -- 1) SHOOT GUI button - this is what video shows: 6/10 SHOOT on right. Must check ammo.
-    local shootBtn = findShootButtonV6()
+    -- 1) SHOOT GUI button with ammo check
+    local shootBtn = findShootButton()
     if shootBtn then
         local ammo = nil
         pcall(function()
@@ -1779,14 +1490,13 @@ function shootPetV6(pet)
             if a then ammo = tonumber(a) end
         end)
         if ammo ~= nil and ammo <= 0 then
-            setStatus("SHOOT: out of ammo (0/10) - waiting reload", "warn")
+            setStatus("SHOOT: out of ammo - waiting reload", "warn")
             return false
         end
-        -- Try Activate + firesignal + VIM click at button center (3 methods, first that works)
         pcall(function() if firesignal then firesignal(shootBtn.Activated) shot = true end end)
         if not shot then pcall(function() shootBtn:Activate() shot = true end) end
         if not shot then pcall(function()
-            VIM = game:GetService("VirtualInputManager")
+            local VIM = game:GetService("VirtualInputManager")
             local pos = shootBtn.AbsolutePosition local sz = shootBtn.AbsoluteSize
             local cx, cy = pos.X + sz.X/2, pos.Y + sz.Y/2
             VIM:SendMouseButtonEvent(cx, cy, 0, true, game, 0)
@@ -1794,7 +1504,7 @@ function shootPetV6(pet)
             VIM:SendMouseButtonEvent(cx, cy, 0, false, game, 0)
             shot = true
         end) end
-        if shot then print("[PetESP v6] Shoot via SHOOT button, ammo was "..tostring(ammo)) return true end
+        if shot then print("[PetESP v6] Shoot via SHOOT button, ammo "..tostring(ammo)) return true end
     end
     -- 2) Tool Activate
     pcall(function()
@@ -1802,9 +1512,9 @@ function shootPetV6(pet)
         if ch then local tool = ch:FindFirstChildOfClass("Tool") if tool then tool:Activate() shot = true end end
     end)
     if shot then print("[PetESP v6] Shoot via Tool") return true end
-    -- 3) Center click (fallback)
+    -- 3) Center click
     pcall(function()
-        VIM = game:GetService("VirtualInputManager")
+        local VIM = game:GetService("VirtualInputManager")
         local cam = workspace.CurrentCamera
         local vs = cam and cam.ViewportSize or Vector2.new(800,600)
         VIM:SendMouseButtonEvent(vs.X/2, vs.Y/2, 0, true, game, 0)
@@ -1815,7 +1525,7 @@ function shootPetV6(pet)
     if shot then print("[PetESP v6] Shoot via center click") return true end
     -- 4) Remote
     pcall(function()
-        RS = game:GetService("ReplicatedStorage")
+        local RS = game:GetService("ReplicatedStorage")
         for _, d in ipairs(RS:GetDescendants()) do
             if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
                 local n = string.lower(d.Name)
@@ -1828,27 +1538,32 @@ function shootPetV6(pet)
     end)
     return shot
 end
-function autoAimTickV6()
+
+-- Auto-aim tick: aim at top pet every frame, shoot when crosshair on target
+local function autoAimTick()
     if not CONFIG.AUTO_AIM then return end
     if collectState ~= "IDLE" then return end
-    if not topPet or not topPet.Parent then setStatus("Auto-Aim ON - no wild pets (base pets excluded) | Scanned "..tostring(ESP_DEBUG.scannedModels).." models, "..tostring(ESP_DEBUG.petCandidates).." candidates - DIAG for list", "warn") return end
+    if not topPet or not topPet.Parent then
+        setStatus("Auto-Aim ON - no wild pets (base excluded)", "warn")
+        return
+    end
     local isD = false pcall(function() isD = isDowned(topPet) end)
     if isD then return end
     if os.clock() - lastAimAt > 1 then pcall(tryScope) end
-    -- V6: aim every Heartbeat tick, not only every AIM_COOLDOWN, so camera tracks moving air pets
     local pos = getPetCenter(topPet)
     local distAim = math.floor((pos - CONFIG.AIM_POS).Magnitude)
     local info = topInfo or getPetValue(topPet)
-    aimAtPetV6(topPet)
-    if topLabel then topLabel.Text = "TOP: "..tostring(topPet.Name):sub(1,20).." | "..tostring(info.rarity).." "..tostring(info.display).." | "..getPetWorld(topPet).." | "..tostring(distAim).." studs (aim) | CAM AIM" end
-    if lastTarget ~= topPet then lastTarget = topPet AirAimState.frames = 0 setStatus("Aiming TOP: "..tostring(topPet.Name):sub(1,18).." ("..tostring(info.display)..") - camera tracking...", "warn") end
-    if shouldShoot(topPet) then shootPetV6(topPet) end
+    aimAtPet(topPet)
+    if topLabel then topLabel.Text = "TOP: "..tostring(topPet.Name):sub(1,20).." | "..tostring(info.rarity).." "..tostring(info.display).." | "..getPetWorld(topPet).." | "..tostring(distAim).." studs" end
+    if lastTarget ~= topPet then lastTarget = topPet AirAimState.frames = 0 end
+    if shouldShoot(topPet) then shootPet(topPet) end
 end
 
--- V6 FIX 3: MINIGAME - movement-based duck detection + NEXT/SPEED check + ScreenGui.Enabled check
--- Replaces findMinigameGui + findDucks in v5. Ducks in video are generic ImageLabels, not named Duck. Tree is static, ducks move.
+-- ===== UNIFIED MINIGAME =====
+-- Detects duck minigame UI by score/combo/next/speed/bonus text, taps ducks via VIM + Activate
+
 MinigameLastPos = {}
-function findMinigameGuiV6()
+local function findMinigameGui()
     local guis = {}
     pcall(function() table.insert(guis, playerGui) end)
     pcall(function() local h = hostFor() if h then table.insert(guis, h) end end)
@@ -1859,31 +1574,29 @@ function findMinigameGuiV6()
             if ok and desc then
                 for _, f in ipairs(desc) do
                     if f:IsA("Frame") and f.Visible then
-                        -- Check ScreenGui.Enabled: if parent ScreenGui is disabled, frame is not really open
                         local sg = f:FindFirstAncestorWhichIsA("ScreenGui")
                         if sg and sg.Enabled == false then
-                            -- skip, not open
-                        else
-                            if f.AbsoluteSize.X > 50 and f.AbsoluteSize.Y > 50 then
-                                local hasScore, hasCombo, hasNext, hasSpeed, hasBonus = false, false, false, false, false
-                                pcall(function()
-                                    for _, d in ipairs(f:GetDescendants()) do
-                                        if d:IsA("TextLabel") or d:IsA("TextButton") then
-                                            local t = string.lower(tostring(d.Text or ""))
-                                            if string.find(t, "score", 1, true) then hasScore = true end
-                                            if string.find(t, "combo", 1, true) then hasCombo = true end
-                                            if string.find(t, "next", 1, true) then hasNext = true end
-                                            if string.find(t, "speed", 1, true) then hasSpeed = true end
-                                            if string.find(t, "bonus", 1, true) then hasBonus = true end
-                                        end
+                            -- not open
+                        elseif f.AbsoluteSize.X > 50 and f.AbsoluteSize.Y > 50 then
+                            local hasScore, hasCombo, hasNext, hasSpeed, hasBonus = false, false, false, false, false
+                            pcall(function()
+                                for _, d in ipairs(f:GetDescendants()) do
+                                    if d:IsA("TextLabel") or d:IsA("TextButton") then
+                                        local t = string.lower(tostring(d.Text or ""))
+                                        if string.find(t, "score", 1, true) then hasScore = true end
+                                        if string.find(t, "combo", 1, true) then hasCombo = true end
+                                        if string.find(t, "next", 1, true) then hasNext = true end
+                                        if string.find(t, "speed", 1, true) then hasSpeed = true end
+                                        if string.find(t, "bonus", 1, true) then hasBonus = true end
                                     end
-                                end)
-                                if (hasScore and hasCombo) or (hasNext and hasSpeed and hasBonus) then
-                                    return f
                                 end
-                                if string.find(string.lower(f.Name), "minigame", 1, true) or string.find(string.lower(f.Name), "treadmill", 1, true) then
-                                    if hasScore or hasNext then return f end
-                                end
+                            end)
+                            if (hasScore and hasCombo) or (hasNext and hasSpeed and hasBonus) then
+                                return f
+                            end
+                            local ln = string.lower(f.Name or "")
+                            if (string.find(ln, "minigame", 1, true) or string.find(ln, "treadmill", 1, true) or string.find(ln, "duck", 1, true)) and (hasScore or hasNext) then
+                                return f
                             end
                         end
                     end
@@ -1893,9 +1606,11 @@ function findMinigameGuiV6()
     end
     return nil
 end
-function findDucksV6()
+local function isMinigameOpen() return findMinigameGui() ~= nil end
+
+local function findDucks()
     local out = {}
-    local mg = findMinigameGuiV6()
+    local mg = findMinigameGui()
     if not mg then return out, nil end
     local mgPos = mg.AbsolutePosition
     local mgSize = mg.AbsoluteSize
@@ -1903,14 +1618,13 @@ function findDucksV6()
     if not ok or not desc then return out, mg end
     for _, d in ipairs(desc) do
         pcall(function()
-            if (d:IsA("ImageLabel") or d:IsA("ImageButton") or d:IsA("TextButton")) and d.Visible then
+            if (d:IsA("ImageLabel") or d:IsA("ImageButton") or d:IsA("TextButton") or d:IsA("GuiButton")) and d.Visible then
                 local sz = d.AbsoluteSize
                 if sz.X >= 20 and sz.X <= 120 and sz.Y >= 20 and sz.Y <= 120 then
                     local n = string.lower(d.Name or "")
                     if not (string.find(n, "tree", 1, true) or string.find(n, "cloud", 1, true) or string.find(n, "ground", 1, true) or string.find(n, "sky", 1, true) or string.find(n, "background", 1, true) or string.find(n, "back", 1, true) or string.find(n, "score", 1, true) or string.find(n, "combo", 1, true) or string.find(n, "bonus", 1, true) or string.find(n, "next", 1, true) or string.find(n, "speed", 1, true)) then
                         local relY = (d.AbsolutePosition.Y - mgPos.Y) / math.max(1, mgSize.Y)
                         local relX = (d.AbsolutePosition.X - mgPos.X) / math.max(1, mgSize.X)
-                        -- Must be inside sky area: relY 0.15-0.85, relX 0.05-0.95 (excludes top bar SCORE, bottom NEXT bar)
                         if relY > 0.15 and relY < 0.85 and relX > 0.02 and relX < 0.98 then
                             local isNamedDuck = string.find(n, "duck", 1, true) or string.find(n, "bird", 1, true) or string.find(n, "target", 1, true) or string.find(n, "enemy", 1, true)
                             local last = MinigameLastPos[d]
@@ -1919,7 +1633,6 @@ function findDucksV6()
                                 if (d.AbsolutePosition - last).Magnitude > 5 then moved = true end
                             end
                             MinigameLastPos[d] = d.AbsolutePosition
-                            -- V6: Named duck OR moved (tree is static, so moved=false for tree) OR generic ImageLabel in sky with size 30-70 (ducks are 30-60, clouds are larger / whiter)
                             if isNamedDuck or moved or (d:IsA("ImageLabel") and sz.X >= 25 and sz.X <= 70 and sz.Y >= 25 and sz.Y <= 70) then
                                 table.insert(out, d)
                             end
@@ -1929,14 +1642,13 @@ function findDucksV6()
             end
         end)
     end
-    -- Dedupe
     local seen = {}
     local uniq = {}
     for _, d in ipairs(out) do if not seen[d] then seen[d] = true table.insert(uniq, d) end end
-    -- 3D fallback
+    -- 3D fallback: workspace ducks with ClickDetector
     pcall(function()
         for _, m in ipairs(workspace:GetDescendants()) do
-            if m:IsA("Model") and (string.find(string.lower(m.Name), "duck", 1, true) or string.find(string.lower(m.Name), "bird", 1, true)) then
+            if m:IsA("Model") and (string.find(string.lower(m.Name or ""), "duck", 1, true) or string.find(string.lower(m.Name or ""), "bird", 1, true)) then
                 local cd = m:FindFirstChildOfClass("ClickDetector", true)
                 if cd then table.insert(uniq, { _is3D = true, model = m, detector = cd, Name = m.Name }) end
             end
@@ -1945,71 +1657,198 @@ function findDucksV6()
     return uniq, mg
 end
 
--- V6 OVERRIDES: replace old scanners / aim / shoot / minigame with V6 versions
--- Keep old getAllPets as fallback
-getAllPetsOld = getAllPets
-getAllPets = function()
-    local uni = getAllPetsUniversal()
-    if uni and #uni > 0 then return uni end
-    local ok, old = pcall(function() return getAllPetsOld() end)
-    if ok and old then return old end
-    return uni or {}
+local function autoTapDuck(duck)
+    local key = duck
+    if duck._is3D then key = duck.model end
+    local now = os.clock()
+    if MinigameTapped[key] and now - MinigameTapped[key] < 0.4 then return false end
+    MinigameTapped[key] = now
+    local tapped = false
+    if duck._is3D then
+        pcall(function()
+            if fireclickdetector then fireclickdetector(duck.detector) tapped = true end
+        end)
+        if not tapped then
+            pcall(function()
+                local cam = workspace.CurrentCamera
+                local pos = duck.model:GetPivot().Position
+                local v, on = cam:WorldToViewportPoint(pos)
+                if on then
+                    local VIM = game:GetService("VirtualInputManager")
+                    VIM:SendMouseMoveEvent(v.X, v.Y, game)
+                    VIM:SendMouseButtonEvent(v.X, v.Y, 0, true, game)
+                    task.wait(0.03)
+                    VIM:SendMouseButtonEvent(v.X, v.Y, 0, false, game)
+                    tapped = true
+                end
+            end)
+        end
+    else
+        -- GUI duck: Activate + VIM click at center
+        pcall(function()
+            if duck:IsA("GuiButton") then duck:Activate() tapped = true end
+        end)
+        pcall(function()
+            local VIM = game:GetService("VirtualInputManager")
+            local pos = duck.AbsolutePosition
+            local sz = duck.AbsoluteSize
+            local cx, cy = pos.X + sz.X/2, pos.Y + sz.Y/2
+            VIM:SendMouseMoveEvent(cx, cy, game)
+            task.wait(0.01)
+            VIM:SendMouseButtonEvent(cx, cy, 0, true, game)
+            task.wait(0.03)
+            VIM:SendMouseButtonEvent(cx, cy, 0, false, game)
+            tapped = true
+        end)
+    end
+    if tapped then
+        MinigameStats.tapped = MinigameStats.tapped + 1
+        MinigameStats.lastTapAt = now
+        MinigameStats.lastDuckName = tostring(duck.Name or "Duck")
+    end
+    return tapped
 end
-isInBaseOld = isInBase
-isInBase = function(pet)
-    local ok, v = pcall(function() return isInBaseV6(pet) end)
-    if ok then return v end
-    return isInBaseOld(pet)
-end
-aimAtPetFixedOld = aimAtPetFixed
-aimAtPetFixed = function(pet, isScoped) return aimAtPetV6(pet) end
-shootPetOld = shootPet
-shootPet = function(pet) return shootPetV6(pet) end
-autoAimTickOld = autoAimTick
-autoAimTick = function() return autoAimTickV6() end
-findMinigameGuiOld = findMinigameGui
-findMinigameGui = function() return findMinigameGuiV6() end
-findDucksOld = findDucks
-findDucks = function() return findDucksV6() end
-isMinigameOpen = function() return findMinigameGuiV6() ~= nil end
-print("[PetESP v6] Overrides applied: universal ESP + camera aim + SHOOT button + movement ducks")
 
--- MAIN LOOPS v2.1
---------------------------------------------------------------------------------
-task.spawn(function()
-    while gui and gui.Parent do
-        local ok, err = pcall(function()
+local function minigameTick()
+    if not CONFIG.AUTO_MINIGAME then return 0 end
+    local mg = findMinigameGui()
+    if not mg then return 0 end
+    local ducks = findDucks()
+    local tappedNow = 0
+    for _, d in ipairs(ducks) do
+        if autoTapDuck(d) then tappedNow = tappedNow + 1 end
+    end
+    if tappedNow > 0 then
+        setStatus("DUCK tapped x" .. tostring(MinigameStats.tapped) .. " (+" .. tostring(tappedNow) .. ")", "ok")
+    end
+    return tappedNow
+end
+
+local MinigameLoopRunning = false
+local function startMinigameLoop()
+    if MinigameLoopRunning then return end
+    MinigameLoopRunning = true
+    task.spawn(function()
+        while CONFIG.AUTO_MINIGAME do
+            local ok, err = pcall(function() minigameTick() end)
+            if not ok then print("[PetESP v6] minigameTick err:", err) end
+            task.wait(0.08)
+        end
+        MinigameLoopRunning = false
+    end)
+end
+
+local function setAutoMinigame(on)
+    CONFIG.AUTO_MINIGAME = on
+    if on then
+        MinigameStats.tapped = 0
+        MinigameTapped = {}
+        setStatus("AUTO MINIGAME ON - tapping ducks...", "ok")
+        startMinigameLoop()
+    else
+        setStatus("AUTO MINIGAME OFF - tapped " .. tostring(MinigameStats.tapped) .. " ducks", "warn")
+    end
+    if refreshUI then refreshUI() end
+    showPill()
+end
+
+-- ===== AUTO-COLLECT (state machine) =====
+-- Priority: collect downed pet -> TP to base -> return to aim. Pauses aim while busy.
+
+local function collectDownedPet(entry)
+    local pet = entry.pet
+    if not pet or not pet.Parent then return end
+    local id = tostring(pet:GetDebugId())
+    if collectBusy[id] then return end
+    if os.clock() - lastCollectAt < CONFIG.COLLECT_COOLDOWN then return end
+    lastCollectAt = os.clock()
+    collectBusy[id] = true
+    collectState = "GOTO_DOWNED"
+    local pos = entry.pos or getPetCenter(pet)
+    setStatus("DOWNED: "..tostring(pet.Name):sub(1,18).." ("..tostring(entry.info.display)..") "..tostring(entry.timer).." - collecting...", "warn")
+    -- TP to downed pet with offset
+    tpTo(pos + Vector3.new(3, 2, 3))
+    task.wait(0.5)
+    -- Verify still downed
+    local stillDowned = false pcall(function() stillDowned = isDowned(pet) end)
+    if not stillDowned then
+        setStatus("Downed pet gone - back to aim", "warn")
+        collectState = "IDLE"
+        if CONFIG.AUTO_AIM then tpTo(CONFIG.AIM_POS) end
+        task.wait(0.3)
+        task.delay(10, function() collectBusy[id] = nil end)
+        return
+    end
+    collectState = "COLLECT"
+    setStatus("Collecting "..tostring(pet.Name):sub(1,18).."...", "warn")
+    tryCollectInteract(pet)
+    task.wait(0.6)
+    -- TP to base to deposit
+    collectState = "TP_BASE"
+    setStatus("Collected! TP to base 5977, 3, 99...", "ok")
+    tpTo(CONFIG.BASE_POS + Vector3.new(0, 3, 0))
+    task.wait(0.8)
+    -- Return to aim spot if auto-aim is on
+    if CONFIG.AUTO_AIM then
+        collectState = "RETURN_AIM"
+        tpTo(CONFIG.AIM_POS)
+        task.wait(0.4)
+    end
+    collectState = "IDLE"
+    task.delay(10, function() collectBusy[id] = nil end)
+    setStatus("Collected "..tostring(pet.Name):sub(1,18).." -> base. Back to aim.", "ok")
+end
+
+local function autoCollectTick()
+    if not CONFIG.AUTO_COLLECT then return end
+    if collectState ~= "IDLE" then return end
+    local downed = getDownedPets(CONFIG.WORLD_FILTER)
+    downedCount = #downed
+    if #downed > 0 then
+        task.spawn(function() collectDownedPet(downed[1]) end)
+    else
+        downedCount = 0
+    end
+end
+
+-- ===== MAIN LOOP (single Heartbeat-driven) =====
+local lastEspAt = 0
+local lastTopAt = 0
+RunService.Heartbeat:Connect(function()
+    if not gui or not gui.Parent then return end
+    local ok, err = pcall(function()
+        local now = os.clock()
+
+        -- Collect has highest priority
+        if CONFIG.AUTO_COLLECT then autoCollectTick() end
+
+        -- ESP + top pet refresh (rate limited)
+        if now - lastEspAt >= CONFIG.ESP_REFRESH then
+            lastEspAt = now
             local tp, ti = getTopPetSmart(CONFIG.WORLD_FILTER)
             topPet = tp; topInfo = ti
-            -- Downed count for label (also used by collect)
-            local downedList = getDownedPets(CONFIG.WORLD_FILTER)
-            downedCount = #downedList
             updateESP()
             if tp and ti then
                 local pos = getPetCenter(tp)
                 local distAim = math.floor((pos - CONFIG.AIM_POS).Magnitude)
                 local hrp = getHRP()
                 local distYou = hrp and math.floor((pos - hrp.Position).Magnitude) or 0
-                if topLabel then topLabel.Text = "⭐ TOP: "..tostring(tp.Name):sub(1,20).."\n"..tostring(ti.rarity).." • "..tostring(ti.display).." | "..getPetWorld(tp).." | "..tostring(distAim).." studs (aim) / "..tostring(distYou).." (you)" end
+                if topLabel then topLabel.Text = "TOP: "..tostring(tp.Name):sub(1,20).." | "..tostring(ti.rarity).." "..tostring(ti.display).." | "..getPetWorld(tp).." | "..tostring(distAim).."m aim / "..tostring(distYou).."m you" end
             else
-                if topLabel then topLabel.Text = "⭐ TOP: — (no wild pets in "..CONFIG.WORLD_FILTER..", base excluded)" end
+                if topLabel then topLabel.Text = "TOP: — (no wild pets, base excluded)" end
             end
             refreshUI()
-        end)
-        if not ok then print("[PetESP v6] scan error:", err) end
-        task.wait(CONFIG.ESP_REFRESH)
-    end
-end)
-RunService.Heartbeat:Connect(function()
-    if not gui or not gui.Parent then return end
-    local ok, err = pcall(function()
-        -- Collect has priority: if downed exists, collect first, pause aim
-        if CONFIG.AUTO_COLLECT then autoCollectTick() end
+        end
+
+        -- Auto-aim (every frame while idle)
         if CONFIG.AUTO_AIM then autoAimTick() end
+
+        -- Shot verify
         checkShotVerify()
     end)
     if not ok then print("[PetESP v6] tick error:", err) end
 end)
+
 refreshUI()
 showPill()
-setStatus("🎯 Pet ESP v3 FIXED - compact ESP, base excluded, auto-collect ready. Press DIAG to test.", "ok")
+setStatus("Pet ESP v6 READY - ESP, aim, shoot, collect, minigame. Press DIAG to test.", "ok")
