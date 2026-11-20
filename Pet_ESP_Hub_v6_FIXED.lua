@@ -19,7 +19,7 @@
 --   Buy : ReplicatedStorage.Remotes.Buy:InvokeServer("DartsAll", "All")
 --   >>> Edit CONFIG.WEAPON_NAME / CONFIG.DART_NAME below to the weapon + dart you use.
 
-print("[PetESP v8.1] ====== LOADED OK - MOBILE + ANY ZONES + CLEAN ESP ======")
+print("[PetESP v8.2] ====== LOADED OK - MOBILE + ANY ZONES + CLEAN ESP ======")
 
 local Players      = game:GetService("Players")
 local Workspace    = game:GetService("Workspace")
@@ -31,7 +31,7 @@ local LocalPlayer  = Players.LocalPlayer
 local PlayerGui    = LocalPlayer:WaitForChild("PlayerGui")
 
 local IS_MOBILE = UserInput.TouchEnabled and not UserInput.MouseEnabled
-print("[PetESP v8.1] IS_MOBILE = " .. tostring(IS_MOBILE))
+print("[PetESP v8.2] IS_MOBILE = " .. tostring(IS_MOBILE))
 
 local CONFIG = {
     AIM_POS = Vector3.new(5973, 3, 2),
@@ -54,7 +54,7 @@ local CONFIG = {
     AIM_COOLDOWN  = 1.2,
     COLLECT_COOLDOWN = 1.0,
 
-    -- v8.1 flags
+    -- v8.2 flags
     FORCE_AIM_SPOT = false,          -- true = old fixed-scope behaviour (teleport to AIM_POS before shooting)
     TP_BASE_AFTER_COLLECT = true,    -- after catching a wild downed pet, teleport to BASE_POS
 
@@ -232,6 +232,20 @@ local function getPetValue(model)
     if type(v) == "number" and v > 0 then return v end
     local iv = model:FindFirstChild("Value") or model:FindFirstChild("Price")
     if iv and (iv:IsA("IntValue") or iv:IsA("NumberValue")) and iv.Value > 0 then return iv.Value end
+    
+    -- NEW: Check for a Configuration folder with Value/Price children
+    local config = model:FindFirstChild("Configuration")
+    if config then
+        for _, c in ipairs(config:GetChildren()) do
+            if c:IsA("NumberValue") or c:IsA("IntValue") then
+                local low = c.Name:lower()
+                if low:find("value", 1, true) or low:find("price", 1, true) or low:find("worth", 1, true) then
+                    if c.Value > 0 then return c.Value end
+                end
+            end
+        end
+    end
+
     local rarity = getPetRarity(model)
     if RARITY_VALUES[rarity] then return RARITY_VALUES[rarity] end
     local name = getPetName(model)
@@ -310,7 +324,7 @@ local function updateFreeToCatch()
                     end
                 end
                 if freeToCatchName then
-                    print("[PetESP v8.1] FreeToCatch = " .. freeToCatchName)
+                    print("[PetESP v8.2] FreeToCatch = " .. freeToCatchName)
                 end
                 break
             end
@@ -426,9 +440,9 @@ local function findAllZones()
     end
     if #cachedZones ~= cachedZonesCount then
         cachedZonesCount = #cachedZones
-        print("[PetESP v8.1] Found Zones folders: " .. #cachedZones)
+        print("[PetESP v8.2] Found Zones folders: " .. #cachedZones)
         for _, z in ipairs(cachedZones) do
-            print("[PetESP v8.1] Zones: " .. z:GetFullName() .. " | Subzones: " .. #z:GetChildren())
+            print("[PetESP v8.2] Zones: " .. z:GetFullName() .. " | Subzones: " .. #z:GetChildren())
         end
     end
     return cachedZones
@@ -458,8 +472,9 @@ local function scanZonesFast()
         local hasHum  = obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") ~= nil
         local hasVal  = getAttr(obj, "Value") ~= nil or getAttr(obj, "Rarity") ~= nil or getAttr(obj, "PetName") ~= nil
         local parentSpawns = obj.Parent and obj.Parent.Name == "Spawns"
+        local isPet   = (obj:IsA("Model") and #obj.Name > 3 and not Players:GetPlayerFromCharacter(obj))
 
-        if not (isSpawn or hasHum or hasVal or parentSpawns) then return end
+        if not (isSpawn or hasHum or hasVal or parentSpawns or isPet) then return end
         if not findRootPart(obj) then return end
 
         seen[obj] = true
@@ -486,7 +501,7 @@ local function scanZonesFast()
         end
     end
 
-    for _, name in ipairs({"ClientPets", "Pets", "WildPets", "DownedPets"}) do
+    for _, name in ipairs({"ClientPets", "Pets", "WildPets", "DownedPets", "WildAnimals", "Animals", "Mobs", "Living"}) do
         local c = Workspace:FindFirstChild(name)
         if c then
             for _, child in ipairs(c:GetChildren()) do
@@ -597,21 +612,28 @@ pcall(function() ScreenGui.Parent = game:GetService("CoreGui") end)
 if not ScreenGui.Parent then ScreenGui.Parent = PlayerGui end
 
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 235, 0, 372)
+MainFrame.Size = UDim2.new(0, 240, 0, 400)
 MainFrame.Position = UDim2.new(0, 10, 0, 10)
-MainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+MainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
 MainFrame.BorderSizePixel = 0
 MainFrame.Active = true
 MainFrame.Draggable = true
 MainFrame.Parent = ScreenGui
-Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 12)
+
+local Stroke = Instance.new("UIStroke")
+Stroke.Thickness = 1.8
+Stroke.Color = Color3.fromRGB(0, 255, 140)
+Stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+Stroke.Parent = MainFrame
 
 local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(1, 0, 0, 32)
+Title.Size = UDim2.new(1, -30, 0, 32)
+Title.Position = UDim2.new(0, 10, 0, 0)
 Title.BackgroundTransparency = 1
-Title.Text = "  PET ESP HUB v8.1 MOBILE"
+Title.Text = "PET ESP HUB v8.2 FIXED"
 Title.TextColor3 = Color3.fromRGB(0, 255, 140)
-Title.TextSize = 13
+Title.TextSize = 14
 Title.Font = Enum.Font.GothamBold
 Title.TextXAlignment = Enum.TextXAlignment.Left
 Title.Parent = MainFrame
@@ -620,50 +642,57 @@ local MobileLabel = Instance.new("TextLabel")
 MobileLabel.Size = UDim2.new(1, -20, 0, 16)
 MobileLabel.Position = UDim2.new(0, 10, 0, 32)
 MobileLabel.BackgroundTransparency = 1
-MobileLabel.Text = IS_MOBILE and "Mobile Mode: Camera Aim + Tap Shoot" or "PC Mode: Camera Aim + Click"
+MobileLabel.Text = IS_MOBILE and "MOBILE MODE: CAMERA AIM" or "PC MODE: CLICK TO SHOOT"
 MobileLabel.TextColor3 = Color3.fromRGB(255, 200, 0)
 MobileLabel.TextSize = 10
-MobileLabel.Font = Enum.Font.Gotham
+MobileLabel.Font = Enum.Font.GothamMedium
 MobileLabel.TextXAlignment = Enum.TextXAlignment.Left
 MobileLabel.Parent = MainFrame
 
 local function makeToggle(y, text, default, callback)
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, -20, 0, 28)
+    btn.Size = UDim2.new(1, -20, 0, 30)
     btn.Position = UDim2.new(0, 10, 0, y)
-    btn.BackgroundColor3 = default and Color3.fromRGB(0, 170, 90) or Color3.fromRGB(60, 60, 65)
+    btn.BackgroundColor3 = default and Color3.fromRGB(0, 150, 80) or Color3.fromRGB(50, 50, 55)
     btn.TextColor3 = Color3.fromRGB(255, 255, 255)
     btn.TextSize = 12
-    btn.Font = Enum.Font.Gotham
+    btn.Font = Enum.Font.GothamSemibold
     btn.Text = text .. (default and " : ON" or " : OFF")
     btn.Parent = MainFrame
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+    
+    local s = Instance.new("UIStroke")
+    s.Thickness = 1
+    s.Color = Color3.fromRGB(255,255,255)
+    s.Transparency = 0.8
+    s.Parent = btn
+
     local state = default
     btn.MouseButton1Click:Connect(function()
         state = not state
-        btn.BackgroundColor3 = state and Color3.fromRGB(0, 170, 90) or Color3.fromRGB(60, 60, 65)
+        btn.BackgroundColor3 = state and Color3.fromRGB(0, 150, 80) or Color3.fromRGB(50, 50, 55)
         btn.Text = text .. (state and " : ON" or " : OFF")
         callback(state)
     end)
     return btn
 end
 
-makeToggle(52,  "ESP", CONFIG.ESP_ENABLED,  function(v) CONFIG.ESP_ENABLED = v end)
-makeToggle(84,  "Auto-Aim", CONFIG.AUTO_AIM, function(v) CONFIG.AUTO_AIM = v end)
-makeToggle(116, "Auto-Collect WILD Downed", CONFIG.AUTO_COLLECT, function(v) CONFIG.AUTO_COLLECT = v end)
-makeToggle(148, "Minigame Tap", CONFIG.MINIGAME, function(v) CONFIG.MINIGAME = v end)
-makeToggle(180, "LOW LAG MODE", CONFIG.LOW_LAG, function(v)
+makeToggle(55,  "ESP ENABLED", CONFIG.ESP_ENABLED,  function(v) CONFIG.ESP_ENABLED = v end)
+makeToggle(90,  "AUTO-AIM LOCK", CONFIG.AUTO_AIM, function(v) CONFIG.AUTO_AIM = v end)
+makeToggle(125, "AUTO-COLLECT WILD", CONFIG.AUTO_COLLECT, function(v) CONFIG.AUTO_COLLECT = v end)
+makeToggle(160, "MINIGAME TAP", CONFIG.MINIGAME, function(v) CONFIG.MINIGAME = v end)
+makeToggle(195, "LOW LAG MODE", CONFIG.LOW_LAG, function(v)
     CONFIG.LOW_LAG = v
-    CONFIG.TOP_N = v and 8 or 10
-    print("[PetESP v8.1] LOW LAG = " .. tostring(v))
+    CONFIG.TOP_N = v and 8 or 12
+    print("[PetESP v8.2] LOW LAG = " .. tostring(v))
 end)
 
 local ModeBtn = Instance.new("TextButton")
-ModeBtn.Size = UDim2.new(1, -20, 0, 28)
-ModeBtn.Position = UDim2.new(0, 10, 0, 212)
-ModeBtn.BackgroundColor3 = Color3.fromRGB(80, 40, 180)
+ModeBtn.Size = UDim2.new(1, -20, 0, 30)
+ModeBtn.Position = UDim2.new(0, 10, 0, 230)
+ModeBtn.BackgroundColor3 = Color3.fromRGB(70, 40, 160)
 ModeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-ModeBtn.Text = "ESP Mode: Nearest (Tap to switch)"
+ModeBtn.Text = "ESP: Nearest (Tap to change)"
 ModeBtn.TextSize = 11
 ModeBtn.Font = Enum.Font.GothamBold
 ModeBtn.Parent = MainFrame
@@ -671,86 +700,82 @@ Instance.new("UICorner", ModeBtn).CornerRadius = UDim.new(0, 8)
 ModeBtn.MouseButton1Click:Connect(function()
     if CONFIG.ESP_MODE == "Nearest" then
         CONFIG.ESP_MODE = "Value"
-        ModeBtn.Text = "ESP Mode: Highest Value"
+        ModeBtn.Text = "ESP: Highest Value"
     else
         CONFIG.ESP_MODE = "Nearest"
-        ModeBtn.Text = "ESP Mode: Nearest"
+        ModeBtn.Text = "ESP: Nearest"
     end
 end)
 
-local BuyBtn = makeToggle(244, "Auto-Buy All Darts", CONFIG.AUTO_BUY_DARTS, function(v)
+local BuyBtn = makeToggle(265, "AUTO-BUY DARTS", CONFIG.AUTO_BUY_DARTS, function(v)
     CONFIG.AUTO_BUY_DARTS = v
     if v then
         local ok, res = remoteBuyAllDarts()
-        print("[PetESP v8.2] BUY DartsAll/All -> " .. (ok and "OK" or "FAIL") .. " | " .. tostring(res))
+        print("[PetESP v8.2] BUY -> " .. (ok and "OK" or "FAIL"))
         lastBuy = tick()
     end
 end)
 
-local WeaponLabel = Instance.new("TextLabel")
-WeaponLabel.Size = UDim2.new(1, -20, 0, 16)
-WeaponLabel.Position = UDim2.new(0, 10, 0, 346)
-WeaponLabel.BackgroundTransparency = 1
-WeaponLabel.Text = "W: " .. CONFIG.WEAPON_NAME .. "  |  D: " .. CONFIG.DART_NAME
-WeaponLabel.TextColor3 = Color3.fromRGB(160, 200, 255)
-WeaponLabel.TextSize = 10
-WeaponLabel.Font = Enum.Font.Code
-WeaponLabel.TextXAlignment = Enum.TextXAlignment.Left
-WeaponLabel.Parent = MainFrame
-
 local StatusPill = Instance.new("Frame")
 StatusPill.Size = UDim2.new(1, -20, 0, 32)
-StatusPill.Position = UDim2.new(0, 10, 0, 276)
-StatusPill.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+StatusPill.Position = UDim2.new(0, 10, 0, 300)
+StatusPill.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
 StatusPill.Parent = MainFrame
 Instance.new("UICorner", StatusPill).CornerRadius = UDim.new(0, 8)
+local sps = Instance.new("UIStroke")
+sps.Thickness = 1
+sps.Color = Color3.fromRGB(255,255,255)
+sps.Transparency = 0.9
+sps.Parent = StatusPill
 
 statusLabel = Instance.new("TextLabel")
 statusLabel.Size = UDim2.new(1, -10, 1, 0)
 statusLabel.Position = UDim2.new(0, 5, 0, 0)
 statusLabel.BackgroundTransparency = 1
 statusLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-statusLabel.TextSize = 11
+statusLabel.TextSize = 10
 statusLabel.Font = Enum.Font.Code
-statusLabel.Text = "Pets: 0 | Top: none"
+statusLabel.Text = "Scanning..."
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 statusLabel.Parent = StatusPill
 
 local TestBtn = Instance.new("TextButton")
-TestBtn.Size = UDim2.new(1, -20, 0, 28)
-TestBtn.Position = UDim2.new(0, 10, 0, 308)
+TestBtn.Size = UDim2.new(1, -20, 0, 30)
+TestBtn.Position = UDim2.new(0, 10, 0, 337)
 TestBtn.BackgroundColor3 = Color3.fromRGB(40, 90, 255)
 TestBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-TestBtn.Text = "SELF-TEST (F9)"
+TestBtn.Text = "DEBUG / SELF-TEST"
 TestBtn.TextSize = 12
 TestBtn.Font = Enum.Font.GothamBold
 TestBtn.Parent = MainFrame
 Instance.new("UICorner", TestBtn).CornerRadius = UDim.new(0, 8)
+
+local WeaponLabel = Instance.new("TextLabel")
+WeaponLabel.Size = UDim2.new(1, -20, 0, 16)
+WeaponLabel.Position = UDim2.new(0, 10, 0, 375)
+WeaponLabel.BackgroundTransparency = 1
+WeaponLabel.Text = "WEAPON: " .. CONFIG.WEAPON_NAME
+WeaponLabel.TextColor3 = Color3.fromRGB(160, 200, 255)
+WeaponLabel.TextSize = 9
+WeaponLabel.Font = Enum.Font.Code
+WeaponLabel.TextXAlignment = Enum.TextXAlignment.Left
+WeaponLabel.Parent = MainFrame
+
 TestBtn.MouseButton1Click:Connect(function()
     updateFreeToCatch()
     cachedPets = scanZonesFast()
     lastScan = tick()
-    print("[PetESP v8.1] SELF-TEST scanned=" .. #cachedPets .. " | FreeToCatch=" .. tostring(freeToCatchName))
-    local zonesCount = {}
-    for _, p in ipairs(cachedPets) do
-        local z = getZoneName(p)
-        zonesCount[z] = (zonesCount[z] or 0) + 1
-    end
-    for z, c in pairs(zonesCount) do print("[PetESP v8.1] Zone " .. z .. " = " .. c) end
-    for i, p in ipairs(cachedPets) do
-        if i <= 10 then
-            print("[PetESP v8.1] " .. i .. " " .. getPetName(p) .. " | " .. formatValue(getPetValue(p)) .. " | Zone=" .. getZoneName(p) .. " | Downed=" .. tostring(isDowned(p)) .. " | FullName=" .. p:GetFullName())
-        end
-    end
+    print("[PetESP v8.2] SCAN=" .. #cachedPets .. " | FTC=" .. tostring(freeToCatchName))
 end)
 
 local CloseBtn = Instance.new("TextButton")
-CloseBtn.Size = UDim2.new(0, 22, 0, 22)
-CloseBtn.Position = UDim2.new(1, -28, 0, 5)
+CloseBtn.Size = UDim2.new(0, 24, 0, 24)
+CloseBtn.Position = UDim2.new(1, -30, 0, 4)
 CloseBtn.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
 CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 CloseBtn.Text = "X"
-CloseBtn.TextSize = 12
+CloseBtn.TextSize = 14
+CloseBtn.Font = Enum.Font.GothamBold
 CloseBtn.Parent = MainFrame
 Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
 CloseBtn.MouseButton1Click:Connect(function() ScreenGui.Enabled = false end)
@@ -836,7 +861,7 @@ local function tryCollectPet(pet)
     -- 1) Mobile catch button
     local catchBtn = findCatchButton()
     if catchBtn then
-        print("[PetESP v8.1] Tapping Catch for " .. getPetName(pet))
+        print("[PetESP v8.2] Tapping Catch for " .. getPetName(pet))
         tapButton(catchBtn)
         task.wait(0.4)
     end
@@ -893,7 +918,7 @@ local function doAutoAim(target)
 
     local shootBtn = findShootButton()
     if shootBtn then
-        print("[PetESP v8.1] Aim -> " .. getPetName(target) .. " | tapping Shoot")
+        print("[PetESP v8.2] Aim -> " .. getPetName(target) .. " | tapping Shoot")
         tapButton(shootBtn)
         return
     end
@@ -908,7 +933,7 @@ local function doAutoAim(target)
                     if n:find("shoot", 1, true) or n:find("fire", 1, true) or n:find("dart", 1, true) then
                         r:FireServer(center)
                         fired = true
-                        print("[PetESP v8.1] Fired Shoot Remote: " .. r:GetFullName())
+                        print("[PetESP v8.2] Fired Shoot Remote: " .. r:GetFullName())
                         break
                     end
                 end
@@ -968,7 +993,7 @@ local function doMinigame()
         end
     end
     if tapped > 0 then
-        print("[PetESP v8.1] Minigame tapped " .. tapped)
+        print("[PetESP v8.2] Minigame tapped " .. tapped)
     end
 end
 
@@ -1172,9 +1197,9 @@ task.spawn(function()
         end)
 
         if not ok then
-            print("[PetESP v8.1] tick error: " .. tostring(err))
+            print("[PetESP v8.2] tick error: " .. tostring(err))
         end
     end
 end)
 
-print("[PetESP v8.1] Ready - ANY Zones, Clean ESP, Camera Aim, Auto-Collect Wild")
+print("[PetESP v8.2] Ready - ANY Zones, Clean ESP, Camera Aim, Auto-Collect Wild")
