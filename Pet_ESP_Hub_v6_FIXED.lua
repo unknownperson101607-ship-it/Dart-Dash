@@ -744,6 +744,19 @@ local function doAutoAim(target)
 
     -- Aim camera at pet (works for both mobile and PC)
     pcall(function() cam.CFrame = CFrame.lookAt(cam.CFrame.Position, center) end)
+
+    -- SECONDARY aim: move mouse onto the pet's screen position.
+    -- Mouse-follow cameras can overwrite Camera.CFrame next frame, so this makes the
+    -- crosshair converge on the target instead of drifting back.
+    pcall(function()
+        local c2 = getCam()
+        if c2 then
+            local vp, onScreen = c2:WorldToViewportPoint(center)
+            if onScreen and vp.Z > 0 then
+                VIM:SendMouseMoveEvent(vp.X, vp.Y, game)
+            end
+        end
+    end)
     task.wait(0.15)
 
     local shootBtn = findShootButton()
