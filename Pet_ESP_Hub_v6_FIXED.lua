@@ -1,4 +1,4 @@
--- Pet ESP Hub v8.1 MOBILE + ANY ZONES + CLEAN ESP - SEPARATE FROM EGG HUB
+-- Pet ESP Hub v8.2 MOBILE + ANY ZONES + REAL GAME REMOTES
 -- ZONES: scans ANY folder named "Zones" in Workspace (World1, World2, Hub, Worlds...)
 --   Wild pet path: Workspace.<World>.Zones.<Zone>.Spawns.Spawn_<Name>_<n>
 -- FIX LIST vs v8:
@@ -12,6 +12,12 @@
 --   8) scanZonesFast skips nested duplicate models (no double ESP)
 --   9) minigame detection broadened, and never taps our own hub buttons
 --  10) ESP / Collect / Aim all driven from one clean loop with pcall safety
+--
+-- v8.2 REAL GAME REMOTES (this is what actually shoots here - there is no Shoot button):
+--   Aim : ReplicatedStorage.Remotes.EnterAim:FireServer()
+--   Fire: ReplicatedStorage.Remotes.Fire:FireServer(WEAPON, DART, directionUnit)
+--   Buy : ReplicatedStorage.Remotes.Buy:InvokeServer("DartsAll", "All")
+--   >>> Edit CONFIG.WEAPON_NAME / CONFIG.DART_NAME below to the weapon + dart you use.
 
 print("[PetESP v8.1] ====== LOADED OK - MOBILE + ANY ZONES + CLEAN ESP ======")
 
@@ -19,6 +25,7 @@ local Players      = game:GetService("Players")
 local Workspace    = game:GetService("Workspace")
 local UserInput    = game:GetService("UserInputService")
 local VIM          = game:GetService("VirtualInputManager")
+local RunService   = game:GetService("RunService")
 local RepStorage   = game:GetService("ReplicatedStorage")
 local LocalPlayer  = Players.LocalPlayer
 local PlayerGui    = LocalPlayer:WaitForChild("PlayerGui")
@@ -33,7 +40,7 @@ local CONFIG = {
     BASE_BOX = {X_MIN = 5900, X_MAX = 6050, Z_MIN = 20, Z_MAX = 180},
 
     ESP_ENABLED   = true,
-    AUTO_AIM      = false,
+    AUTO_AIM      = true,
     AUTO_COLLECT  = true,
     MINIGAME      = false,
     LOW_LAG       = false,
@@ -50,6 +57,19 @@ local CONFIG = {
     -- v8.1 flags
     FORCE_AIM_SPOT = false,          -- true = old fixed-scope behaviour (teleport to AIM_POS before shooting)
     TP_BASE_AFTER_COLLECT = true,    -- after catching a wild downed pet, teleport to BASE_POS
+
+    -- v8.2 remotes + aim lock
+    USE_REMOTE_FIRE = true,          -- Remotes.EnterAim + Remotes.Fire (the real way this game shoots)
+    WEAPON_NAME     = "RlyehTrident",-- <<< change to the weapon you use
+    DART_NAME       = "Abysse",      -- <<< change to the dart you use
+    FIRE_ORIGIN     = "camera",      -- "camera" or "character" - origin used to build the aim vector
+    FIRE_INTERVAL   = 0.35,          -- seconds between Fire remote calls while locked on
+    AIM_LOCK        = true,          -- glue the camera to the target every frame
+    AIM_LOCK_ALPHA  = 0.45,          -- 0.1 = slow/smooth, 1.0 = instant snap
+    ZOOM_ON_AIM     = true,          -- PC: scroll wheel to enter aim/zoom like a human
+    ZOOM_NOTCHES    = 3,
+    AUTO_BUY_DARTS  = false,
+    BUY_INTERVAL    = 15,
 }
 
 local RARITY_COLORS = {
@@ -83,6 +103,98 @@ local lastMinigame = 0
 local statusLabel  = nil
 local freeToCatchName = nil
 local ScreenGui    = nil   -- forward declaration (assigned later)
+local lastBuy      = 0
+local lockTarget   = nil   -- pet the aim-lock loop is currently glued to
+local aimLockRef   = nil   -- last target we called EnterAim for
+local aimEnteredAt = 0
+
+--------------------------------------------------------------------------------
+-- Real game remotes (confirmed):
+--   Remotes.Buy:InvokeServer("DartsAll", "All")
+--   Remotes.EnterAim:FireServer()
+--   Remotes.Fire:FireServer(weapon, dart, directionUnit)
+--------------------------------------------------------------------------------
+local function getRemotesFolder()
+    return RepStorage:FindFirstChild("Remotes")
+end
+
+local function getRemote(name)
+    local r = getRemotesFolder()
+    local inst = r and r:FindFirstChild(name)
+    if inst and (inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction")) then return inst end
+    return nil
+end
+
+local function unpackArgs(list, n)
+    local up = table.unpack or unpack
+    return up(list, 1, n or #list)
+end
+
+local function remoteBuyAllDarts()
+    local buy = getRemote("Buy")
+    if not buy then return false, "Remotes.Buy missing" end
+    local ok, res = pcall(function() return buy:InvokeServer(unpackArgs({"DartsAll", "All"})) end)
+    return ok, tostring(res)
+end
+
+local function remoteEnterAim()
+    local aim = getRemote("EnterAim")
+    if not aim then return false end
+    return (pcall(function() aim:FireServer() end))
+end
+
+local function getFireOrigin()
+    if CONFIG.FIRE_ORIGIN == "character" then
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then return hrp.Position end
+    end
+    local cam = Workspace.CurrentCamera
+    if cam then return cam.CFrame.Position end
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    return hrp and hrp.Position or Vector3.new(0, 0, 0)
+end
+
+local function remoteFireAt(center)
+    local fire = getRemote("Fire")
+    if not fire or not center then return false end
+    local d = center - getFireOrigin()
+    if d.Magnitude < 0.01 then return false end
+    return (pcall(function()
+        fire:FireServer(CONFIG.WEAPON_NAME, CONFIG.DART_NAME, d.Unit)
+    end))
+end
+
+-- PC: this game enters aim / zooms by scrolling the wheel. Try the known
+-- VirtualInputManager wheel signatures because they differ per executor.
+local function sendWheel(delta)
+    local attempts = {
+        function() VIM:SendMouseWheelEvent(0, delta, true) end,
+        function() VIM:SendMouseWheelEvent(delta, 0, true) end,
+        function() VIM:SendMouseWheelEvent(0, delta, false) end,
+        function() VIM:SendMouseWheelEvent(0, 0, delta) end,
+    }
+    for _, fn in ipairs(attempts) do
+        if pcall(fn) then return true end
+    end
+    return false
+end
+
+-- Enter aim mode: remote first (authoritative), then wheel-scroll for the
+-- real geometry zoom so the animal fills the crosshair.
+local function enterAimMode(force)
+    if not force and tick() - aimEnteredAt < 3 then return true end
+    local ok = remoteEnterAim()
+    if CONFIG.ZOOM_ON_AIM and not IS_MOBILE then
+        for _ = 1, CONFIG.ZOOM_NOTCHES do
+            sendWheel(120)
+            task.wait(0.02)
+        end
+    end
+    aimEnteredAt = tick()
+    return ok
+end
 
 --------------------------------------------------------------------------------
 -- Small helpers
@@ -485,7 +597,7 @@ pcall(function() ScreenGui.Parent = game:GetService("CoreGui") end)
 if not ScreenGui.Parent then ScreenGui.Parent = PlayerGui end
 
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 235, 0, 335)
+MainFrame.Size = UDim2.new(0, 235, 0, 372)
 MainFrame.Position = UDim2.new(0, 10, 0, 10)
 MainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 MainFrame.BorderSizePixel = 0
@@ -566,9 +678,29 @@ ModeBtn.MouseButton1Click:Connect(function()
     end
 end)
 
+local BuyBtn = makeToggle(244, "Auto-Buy All Darts", CONFIG.AUTO_BUY_DARTS, function(v)
+    CONFIG.AUTO_BUY_DARTS = v
+    if v then
+        local ok, res = remoteBuyAllDarts()
+        print("[PetESP v8.2] BUY DartsAll/All -> " .. (ok and "OK" or "FAIL") .. " | " .. tostring(res))
+        lastBuy = tick()
+    end
+end)
+
+local WeaponLabel = Instance.new("TextLabel")
+WeaponLabel.Size = UDim2.new(1, -20, 0, 16)
+WeaponLabel.Position = UDim2.new(0, 10, 0, 346)
+WeaponLabel.BackgroundTransparency = 1
+WeaponLabel.Text = "W: " .. CONFIG.WEAPON_NAME .. "  |  D: " .. CONFIG.DART_NAME
+WeaponLabel.TextColor3 = Color3.fromRGB(160, 200, 255)
+WeaponLabel.TextSize = 10
+WeaponLabel.Font = Enum.Font.Code
+WeaponLabel.TextXAlignment = Enum.TextXAlignment.Left
+WeaponLabel.Parent = MainFrame
+
 local StatusPill = Instance.new("Frame")
 StatusPill.Size = UDim2.new(1, -20, 0, 32)
-StatusPill.Position = UDim2.new(0, 10, 0, 246)
+StatusPill.Position = UDim2.new(0, 10, 0, 276)
 StatusPill.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
 StatusPill.Parent = MainFrame
 Instance.new("UICorner", StatusPill).CornerRadius = UDim.new(0, 8)
@@ -586,7 +718,7 @@ statusLabel.Parent = StatusPill
 
 local TestBtn = Instance.new("TextButton")
 TestBtn.Size = UDim2.new(1, -20, 0, 28)
-TestBtn.Position = UDim2.new(0, 10, 0, 284)
+TestBtn.Position = UDim2.new(0, 10, 0, 308)
 TestBtn.BackgroundColor3 = Color3.fromRGB(40, 90, 255)
 TestBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 TestBtn.Text = "SELF-TEST (F9)"
@@ -841,6 +973,68 @@ local function doMinigame()
 end
 
 --------------------------------------------------------------------------------
+-- AIM LOCK + FIRE  (runs every frame so the crosshair stays glued to the pet)
+--------------------------------------------------------------------------------
+local function clickCenter()
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local vx, vy = cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2
+    pcall(function()
+        VIM:SendMouseButtonEvent(vx, vy, 0, true, game, 0)
+        task.wait(0.02)
+        VIM:SendMouseButtonEvent(vx, vy, 0, false, game, 0)
+    end)
+end
+
+RunService.RenderStepped:Connect(function()
+    if not CONFIG.AUTO_AIM then aimLockRef = nil return end
+
+    local target = lockTarget
+    if not (target and target.Parent) then
+        aimLockRef = nil
+        return
+    end
+
+    local cam = Workspace.CurrentCamera
+    local center = getPetCenter(target)
+    if not (cam and center) then return end
+
+    -- New target: EnterAim remote + PC wheel zoom (once per target)
+    if aimLockRef ~= target then
+        aimLockRef = target
+        enterAimMode(true)
+    end
+
+    -- Continuous lock: this is the "auto lock-on" - re-aimed every frame
+    local want = CFrame.lookAt(cam.CFrame.Position, center)
+    if CONFIG.AIM_LOCK then
+        cam.CFrame = cam.CFrame:Lerp(want, CONFIG.AIM_LOCK_ALPHA)
+    else
+        cam.CFrame = want
+    end
+
+    -- Keep the in-aim crosshair sitting on the animal
+    pcall(function()
+        local vp, onScreen = cam:WorldToViewportPoint(center)
+        if onScreen and vp.Z > 0 then VIM:SendMouseMoveEvent(vp.X, vp.Y, game) end
+    end)
+
+    -- Fire on a steady cadence
+    if tick() - lastAim >= CONFIG.FIRE_INTERVAL then
+        lastAim = tick()
+        local fired = false
+        if CONFIG.USE_REMOTE_FIRE then
+            remoteEnterAim()
+            fired = remoteFireAt(center)
+        end
+        if not fired then
+            local btn = findShootButton()
+            if btn then tapButton(btn) else clickCenter() end
+        end
+    end
+end)
+
+--------------------------------------------------------------------------------
 -- Main loop
 --------------------------------------------------------------------------------
 task.spawn(function()
@@ -948,7 +1142,7 @@ task.spawn(function()
                     .. (freeToCatchName and (" | FTC: " .. freeToCatchName) or "")
             end
 
-            -- Priority: collect wild downed first, else auto-aim
+            -- Priority: collect wild downed first (aim is now handled by the lock loop)
             if CONFIG.AUTO_COLLECT and #downedList > 0 then
                 if tick() - lastCollect >= CONFIG.COLLECT_COOLDOWN then
                     lastCollect = tick()
@@ -958,15 +1152,20 @@ task.spawn(function()
                         return (ca - playerPos).Magnitude < (cb - playerPos).Magnitude
                     end)
                     local target = downedList[1]
-                    print("[PetESP v8.1] Auto-collect WILD downed: " .. getPetName(target) .. " | FTC=" .. tostring(freeToCatchName))
+                    print("[PetESP v8.2] Auto-collect WILD downed: " .. getPetName(target) .. " | FTC=" .. tostring(freeToCatchName))
                     tryCollectPet(target)
                     if CONFIG.TP_BASE_AFTER_COLLECT then
                         task.wait(0.4)
                         teleportTo(CONFIG.BASE_POS)
                     end
                 end
-            elseif CONFIG.AUTO_AIM and #aimCandidates > 0 then
-                doAutoAim(aimCandidates[1])
+            end
+
+            -- Auto-buy darts
+            if CONFIG.AUTO_BUY_DARTS and tick() - lastBuy >= CONFIG.BUY_INTERVAL then
+                lastBuy = tick()
+                local okBuy, resBuy = remoteBuyAllDarts()
+                if not okBuy then print("[PetESP v8.2] auto-buy failed: " .. tostring(resBuy)) end
             end
 
             if CONFIG.MINIGAME then doMinigame() end
