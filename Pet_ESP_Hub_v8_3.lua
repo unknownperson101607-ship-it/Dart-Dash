@@ -11,6 +11,12 @@
 --   * X button = full shutdown (every loop stops, ESP/highlights/GUI destroyed).
 --     "-" button = hide the panel; tap the small PET bubble to bring it back.
 --   * Buttons use .Activated so they work on touch.
+-- v8.3.9 (from the DEBUG next to a sleeping animal):
+--   * The sleeping animal is Workspace.ClientPets.<Name> with a BillboardGui "SleepTimer" whose text is "57,1"
+--     (COMMA decimal). Ring/timer parsing now accepts "57,1" / "57.1" / "m:ss" and any billboard named *Sleep*.
+--   * Hit circles are TEXT on the "PetLabel" billboard ("● ○"): filled = ●, empty = ○/◎. The dart is picked from
+--     that: 2+ empty circles -> fill dart (Magma), 1 empty left -> sleep dart (Abysse).
+--   * SLEEP_DART default back to "Abysse" (that is what the game's own Equip call sends).
 -- v8.3.8:
 --   * Panel scales itself to fit the screen (UIScale; ~0.72 on phones, never taller than the viewport).
 --     CONFIG.GUI_SCALE = "auto" or a number (0.5 = half size).
@@ -122,7 +128,7 @@ local CONFIG = {
     -- v8.3 remotes + aim lock
     USE_REMOTE_FIRE = true,          -- Remotes.EnterAim + Remotes.Fire (the real way this game shoots)
     WEAPON_NAME     = "RlyehTrident",-- <<< change to the weapon you use
-    SLEEP_DART      = "Abyss",       -- dart that puts the animal to sleep (Abyss Harpoon, sleeps 125s)
+    SLEEP_DART      = "Abysse",      -- dart that puts the animal to sleep (Abyss Harpoon, sleeps 125s)
     FILL_DART       = "Magma",        -- cheap dart that fills the hit circles (Magma Harpoon). "auto" = look it up, else "Magma"
     FILL_SHOTS      = 5,             -- fill-dart shots before the sleep dart when the circles can't be read
     SLEEP_RETRY     = 2.0,           -- seconds between sleep-dart shots (saves your Abyss darts)
@@ -608,16 +614,34 @@ local function dartSleepSeconds(dartName)
 end
 
 local ringCache = setmetatable({}, {__mode = "k"})
+
+-- "57,1" / "57.1" -> 57.1 (the game formats the decimal with a comma on some devices)
+local function parseTimerText(txt)
+    local num = txt:match("^%s*(%d+[%.,]%d+)%s*s?%s*$")
+    if num then return tonumber((num:gsub(",", "."))) end
+    return nil
+end
+
 local function ringTimer(model)
     local c = ringCache[model]
     if c and tick() - c.t < 0.25 then return c.v end
     local v = nil
     local function scan(root)
+        local named = root.Name:lower():find("sleep", 1, true) ~= nil      -- e.g. the "SleepTimer" billboard
         for _, d in ipairs(root:GetDescendants()) do
             if d:IsA("TextLabel") then
-                local num = d.Text:match("^%s*(%d+%.%d+)%s*s?%s*$")
-                if num then
-                    v = tonumber(num)
+                local x = parseTimerText(d.Text)
+                if not x and named then
+                    local mm, ss = d.Text:match("^%s*(%d+):(%d%d)%s*$")
+                    if mm then
+                        x = tonumber(mm) * 60 + tonumber(ss)
+                    else
+                        local iv = d.Text:match("^%s*(%d+)%s*s?%s*$")
+                        if iv then x = tonumber(iv) end
+                    end
+                end
+                if x then
+                    v = x
                     return true
                 end
             end
@@ -750,9 +774,10 @@ local function labelState(b)
             local t = d.Text:lower()
             if t:find("%$%s*/%s*s") then inc = true end
             if t:find("%d%s+in%s+%d") then odds = true end
-            if t:match("^%s*%d+%.%d+%s*s?%s*$") then timer = true end
+            if t:match("^%s*%d+[%.,]%d+%s*s?%s*$") then timer = true end
         end
     end
+    if hasText and b.Name:lower():find("sleep", 1, true) then timer = true end
     return inc, odds, hasText, timer
 end
 
@@ -1743,6 +1768,26 @@ local function countHitDots(pet)
 end
 
 -- fill shots needed = total circles - 1 (the last hit is the sleep dart)
+-- The hit circles are TEXT on the animal's "PetLabel" billboard: "● ○ ○" (● filled, ○ / ◎ empty)
+local function dotState(pet)
+    local filled, empty = nil, nil
+    for _, g in ipairs(pet:GetDescendants()) do
+        if g:IsA("BillboardGui") and g.Name ~= "PetESP" then
+            for _, d in ipairs(g:GetDescendants()) do
+                if d:IsA("TextLabel") and d.Text ~= "" then
+                    local f = select(2, d.Text:gsub("●", ""))
+                    local e = select(2, d.Text:gsub("○", "")) + select(2, d.Text:gsub("◎", ""))
+                    if f + e >= 2 then
+                        filled, empty = f, e
+                        return filled, empty
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
 local function fillShotsFor(pet)
     for _, k in ipairs({"MaxHits", "HitsNeeded", "DartsNeeded", "MaxDarts", "RequiredHits"}) do
         local v = getAttr(pet, k)
@@ -1939,7 +1984,14 @@ task.spawn(function()
             -- 3) pick the dart: fill circles first, sleep dart last
             local n = shots[target] or 0
             local dart
-            if n < fillShotsFor(target) then
+            local dFilled, dEmpty = dotState(target)
+            local useFill
+            if dFilled then
+                useFill = dEmpty >= 2                    -- circles readable: fill until one is left
+            else
+                useFill = n < fillShotsFor(target)       -- fallback: count our own shots
+            end
+            if useFill then
                 dart = fillDart
             else
                 if tick() - lastSleepShot < CONFIG.SLEEP_RETRY then return end
@@ -2024,7 +2076,7 @@ debugDump = function()
     end
     local ringsFound = 0
     for _, d in ipairs(Workspace:GetDescendants()) do
-        if d:IsA("TextLabel") and d.Text:match("^%s*%d+%.%d+%s*s?%s*$") then
+        if d:IsA("TextLabel") and d.Text:match("^%s*%d+[%.,]%d+%s*s?%s*$") then
             local g = d:FindFirstAncestorWhichIsA("BillboardGui")
             local host = g and (g.Adornee or g.Parent) or d.Parent
             local m = host and ((host:IsA("Model") and host) or host:FindFirstAncestorWhichIsA("Model"))
@@ -2060,7 +2112,7 @@ debugDump = function()
     print("  -- GUI labels showing $/s or a decimal ring --")
     local shown = 0
     for _, d in ipairs(PlayerGui:GetDescendants()) do
-        if d:IsA("TextLabel") and d.Text ~= "" and (parseIncome(d.Text) or d.Text:match("^%s*%d+%.%d+%s*s?%s*$")) then
+        if d:IsA("TextLabel") and d.Text ~= "" and (parseIncome(d.Text) or d.Text:match("^%s*%d+[%.,]%d+%s*s?%s*$")) then
             local bg = d:FindFirstAncestorWhichIsA("BillboardGui")
             print("  " .. d:GetFullName() .. " = " .. d.Text
                 .. (bg and (" | adornee=" .. (bg.Adornee and bg.Adornee:GetFullName() or "nil")) or ""))
