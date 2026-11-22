@@ -11,6 +11,11 @@
 --   * X button = full shutdown (every loop stops, ESP/highlights/GUI destroyed).
 --     "-" button = hide the panel; tap the small PET bubble to bring it back.
 --   * Buttons use .Activated so they work on touch.
+-- v8.3.2:
+--   * ESP value = the game's own overhead label ("LEGENDARY . 135SP $/S"), parsed with K/M/B/T/Qa/Qi/Sx/Sp/Oc/No/Dc.
+--   * Animals are also discovered through that label (any folder), locked/downed animals always get ESP.
+--   * Scope/shoot: real mouse/touch click (GUI-inset corrected) + signal fallbacks, verified by the SHOOT button
+--     appearing. LEARN FILL / SLEEP / SCOPE buttons record the real dart names + scope button from YOU using them once.
 -- v8.3.1:
 --   * Aim sequence: TP to AIM_POS -> tap Scope -> fill circles with FILL_DART (Magma) ->
 --     finish with SLEEP_DART (Abyss) -> collect the downed animal -> TP to BASE_POS.
@@ -72,7 +77,7 @@ local CONFIG = {
     LOW_LAG       = false,
 
     ESP_MODE      = "Nearest",   -- "Nearest" or "Value"
-    TOP_N         = 10,
+    TOP_N         = 15,
     ESP_MAX_DIST  = 500,
     HIDE_DIST     = 25,
     SCAN_INTERVAL = 2.5,
@@ -91,6 +96,9 @@ local CONFIG = {
     FILL_DART       = "auto",        -- cheap dart that fills the hit circles (Magma Harpoon). "auto" = look it up, else "Magma"
     FILL_SHOTS      = 5,             -- fill-dart shots before the sleep dart when the circles can't be read
     SLEEP_RETRY     = 2.0,           -- seconds between sleep-dart shots (saves your Abyss darts)
+    AUTO_SCOPE      = true,
+    LABEL_DISCOVERY = true,          -- find wild animals by their overhead "$/S" label (any folder)
+    LABEL_NEEDS_ODDS = true,         -- ...and require the "1 in N" line, so base/owned pets are not picked up
     FIRE_ORIGIN     = "camera",      -- "camera" or "character" - origin used to build the aim vector
     FIRE_INTERVAL   = 0.35,          -- seconds between Fire remote calls while locked on
     AIM_LOCK        = true,          -- glue the camera to the target every frame
@@ -149,6 +157,9 @@ local collecting     = false                       -- true while the collect + g
 local collectTried   = setmetatable({}, {__mode = "k"})
 local lastShotTarget = nil
 local debugDump      = nil                         -- assigned later
+local armLearn       = nil                         -- assigned later
+local labelPets      = {}                          -- animals found through their overhead label
+local nativeCache    = setmetatable({}, {__mode = "k"})
 
 --------------------------------------------------------------------------------
 -- Real game remotes (confirmed):
@@ -251,6 +262,58 @@ local function getAttr(obj, name)
     return nil
 end
 
+-- The game draws its own overhead label on every animal: "LEGENDARY . 135SP $/S".
+-- That is the accurate value, so read it instead of guessing.
+local SUFFIX_MULT = { k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15, qi = 1e18,
+                      sx = 1e21, sp = 1e24, oc = 1e27, no = 1e30, dc = 1e33 }
+local VALUE_STEPS = { {"Dc", 1e33}, {"No", 1e30}, {"Oc", 1e27}, {"Sp", 1e24}, {"Sx", 1e21},
+                      {"Qi", 1e18}, {"Qa", 1e15}, {"T", 1e12}, {"B", 1e9}, {"M", 1e6}, {"K", 1e3} }
+
+local function parseIncome(text)
+    local t = text:lower()
+    local num, suf = t:match("([%d%.,]+)%s*(%a*)%s*%$%s*/%s*s")
+    if not num then return nil end
+    num = tonumber((num:gsub(",", "")))
+    if not num then return nil end
+    local mult = 1
+    if suf and suf ~= "" then
+        mult = SUFFIX_MULT[suf]
+        if not mult then return nil end
+    end
+    return num * mult
+end
+
+local function nativeInfo(model)
+    local c = nativeCache[model]
+    if c and tick() - c.t < 1.5 then return c.info end
+    local info = nil
+    local function scan(root)
+        for _, d in ipairs(root:GetDescendants()) do
+            if d:IsA("TextLabel") and d.Text ~= "" then
+                local v = parseIncome(d.Text)
+                if v then
+                    local rw = d.Text:lower():match("^%s*(%a+)")
+                    info = { value = v, text = d.Text,
+                             rarity = rw and (rw:sub(1, 1):upper() .. rw:sub(2)) or nil }
+                    return true
+                end
+            end
+        end
+        return false
+    end
+    for _, g in ipairs(model:GetDescendants()) do
+        if g:IsA("BillboardGui") and g.Name ~= "PetESP" and scan(g) then break end
+    end
+    if not info then
+        for _, g in ipairs(PlayerGui:GetChildren()) do
+            if g:IsA("BillboardGui") and g.Name ~= "PetESP" and g.Adornee
+               and g.Adornee:IsDescendantOf(model) and scan(g) then break end
+        end
+    end
+    nativeCache[model] = { t = tick(), info = info }
+    return info
+end
+
 local function getPetName(model)
     local n = getAttr(model, "PetName") or getAttr(model, "Species")
     if n and tostring(n) ~= "" then return tostring(n) end
@@ -266,10 +329,14 @@ end
 local function getPetRarity(model)
     local r = getAttr(model, "Rarity") or getAttr(model, "Tier")
     if r then return tostring(r) end
+    local ni = nativeInfo(model)
+    if ni and ni.rarity then return ni.rarity end
     return "Common"
 end
 
 local function getPetValue(model)
+    local ni = nativeInfo(model)
+    if ni and ni.value then return ni.value end
     local v = getAttr(model, "Value") or getAttr(model, "Price") or getAttr(model, "Worth")
     if type(v) == "number" and v > 0 then return v end
     local iv = model:FindFirstChild("Value") or model:FindFirstChild("Price")
@@ -296,8 +363,13 @@ local function getPetValue(model)
 end
 
 local function formatValue(v)
-    if v >= 1000 then return string.format("$%.1fk", v / 1000) end
-    return "$" .. tostring(v)
+    for _, st in ipairs(VALUE_STEPS) do
+        if v >= st[2] then
+            local x = v / st[2]
+            return string.format(x >= 100 and "%.0f%s" or (x >= 10 and "%.1f%s" or "%.2f%s"), x, st[1])
+        end
+    end
+    return tostring(math.floor(v))
 end
 
 local function getRarityColor(model)
@@ -335,6 +407,7 @@ local function normAlnum(str)
 end
 
 local function isWildAnimal(model)
+    if labelPets[model] then return true end
     if model.Name:find("Spawn_", 1, true) then return true end
     if model.Parent and model.Parent.Name == "Spawns" then return true end
     if model:IsA("Model") and model:FindFirstChildOfClass("Humanoid") then return true end
@@ -486,6 +559,59 @@ end
 --------------------------------------------------------------------------------
 -- Zone discovery + pet scan
 --------------------------------------------------------------------------------
+-- Label-based discovery: any BillboardGui that shows "$/S" (and the "1 in N" odds line) belongs to a wild animal
+local function labelState(b)
+    local inc, odds, hasText = false, false, false
+    for _, d in ipairs(b:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Text ~= "" then
+            hasText = true
+            local t = d.Text:lower()
+            if t:find("%$%s*/%s*s") then inc = true end
+            if t:find("%d%s+in%s+%d") then odds = true end
+        end
+    end
+    return inc, odds, hasText
+end
+
+local function registerBillboard(b)
+    if not CONFIG.LABEL_DISCOVERY or b.Name == "PetESP" then return end
+    task.spawn(function()
+        for _, w in ipairs({0.4, 1.5, 4}) do
+            task.wait(w)
+            if not RUNNING or not b.Parent then return end
+            local inc, odds, hasText = labelState(b)
+            if inc and (odds or not CONFIG.LABEL_NEEDS_ODDS) then
+                local host = b.Adornee or b.Parent
+                local model = host and ((host:IsA("Model") and host) or host:FindFirstAncestorWhichIsA("Model"))
+                if model and model ~= Workspace and not Players:GetPlayerFromCharacter(model)
+                   and #model:GetChildren() <= 80 and not model:FindFirstChild("Zones") then
+                    labelPets[model] = true
+                end
+                return
+            end
+            if hasText then return end        -- text is there and it is not an animal label
+        end
+    end)
+end
+
+table.insert(connections, Workspace.DescendantAdded:Connect(function(d)
+    if d:IsA("BillboardGui") then registerBillboard(d) end
+end))
+table.insert(connections, PlayerGui.DescendantAdded:Connect(function(d)
+    if d:IsA("BillboardGui") then registerBillboard(d) end
+end))
+task.spawn(function()
+    local n = 0
+    for _, root in ipairs({Workspace, PlayerGui}) do
+        for _, d in ipairs(root:GetDescendants()) do
+            if d:IsA("BillboardGui") then registerBillboard(d) end
+            n = n + 1
+            if n % 4000 == 0 then task.wait() end
+            if not RUNNING then return end
+        end
+    end
+end)
+
 local allZoneFolders, lastZoneEnum = {}, 0
 
 local function normName(str)
@@ -643,6 +769,16 @@ local function scanZonesFast()
         end
     end
 
+    if CONFIG.LABEL_DISCOVERY then
+        for model in pairs(labelPets) do
+            if not model.Parent then
+                labelPets[model] = nil
+            elseif not seen[model] and not ancestorSeen(model) and findRootPart(model) then
+                seen[model] = true
+                table.insert(found, model)
+            end
+        end
+    end
     return found
 end
 
@@ -666,7 +802,7 @@ local function getESP(model, rootPart)
 
     local gui = Instance.new("BillboardGui")
     gui.Name = "PetESP"
-    gui.Size = UDim2.new(0, 130, 0, 24)
+    gui.Size = UDim2.new(0, 190, 0, 24)
     gui.StudsOffset = Vector3.new(0, 3.2, 0)
     gui.AlwaysOnTop = true
     gui.LightInfluence = 0
@@ -746,6 +882,7 @@ local function shutdown()
     CONFIG.MINIGAME = false
     CONFIG.AUTO_BUY_DARTS = false
     lockTarget = nil
+    GENV.PetESPSpyHandler = nil
     pcall(function() RunService:UnbindFromRenderStep(AIM_BIND) end)
     for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
     for m in pairs(espFolder) do clearESP(m) end
@@ -767,7 +904,7 @@ if not parented then pcall(function() ScreenGui.Parent = game:GetService("CoreGu
 if not ScreenGui.Parent then ScreenGui.Parent = PlayerGui end
 
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 240, 0, 420)
+MainFrame.Size = UDim2.new(0, 240, 0, 444)
 MainFrame.Position = UDim2.new(0, 10, 0, 10)
 MainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
 MainFrame.BorderSizePixel = 0
@@ -908,7 +1045,7 @@ Instance.new("UICorner", TestBtn).CornerRadius = UDim.new(0, 8)
 
 local WeaponLabel = Instance.new("TextLabel")
 WeaponLabel.Size = UDim2.new(1, -20, 0, 16)
-WeaponLabel.Position = UDim2.new(0, 10, 0, 392)
+WeaponLabel.Position = UDim2.new(0, 10, 0, 420)
 WeaponLabel.BackgroundTransparency = 1
 WeaponLabel.Text = "WEAPON: " .. CONFIG.WEAPON_NAME .. " | SLEEP: " .. CONFIG.SLEEP_DART
 WeaponLabel.TextColor3 = Color3.fromRGB(160, 200, 255)
@@ -916,6 +1053,23 @@ WeaponLabel.TextSize = 9
 WeaponLabel.Font = Enum.Font.Code
 WeaponLabel.TextXAlignment = Enum.TextXAlignment.Left
 WeaponLabel.Parent = MainFrame
+
+local function makeSmall(x, text, kind)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, 68, 0, 24)
+    b.Position = UDim2.new(0, x, 0, 388)
+    b.BackgroundColor3 = Color3.fromRGB(120, 70, 20)
+    b.TextColor3 = Color3.fromRGB(255, 255, 255)
+    b.Text = text
+    b.TextSize = 9
+    b.Font = Enum.Font.GothamBold
+    b.Parent = MainFrame
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.Activated:Connect(function() if armLearn then armLearn(kind) end end)
+end
+makeSmall(10, "LEARN FILL", "fill")
+makeSmall(86, "LEARN SLEEP", "sleep")
+makeSmall(162, "LEARN SCOPE", "scope")
 
 TestBtn.Activated:Connect(function()
     updateFreeToCatch()
@@ -1032,56 +1186,95 @@ local function isShown(g)
     return true
 end
 
--- Find a button by keywords across PlayerGui + CoreGui, skipping our own hub GUI
+-- Find a button by keywords in its name / own text / any text label inside it (PlayerGui only)
+local function buttonLabel(d)
+    local str = tostring(d.Name or "")
+    if d:IsA("TextButton") then str = str .. " " .. tostring(d.Text or "") end
+    return str:lower()
+end
+
 local function findButton(keywords, excludeOwn)
-    local roots = {}
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
-    if pg then table.insert(roots, pg) end
-    pcall(function()
-        local cg = game:GetService("CoreGui")
-        if cg then table.insert(roots, cg) end
-    end)
-    for _, root in ipairs(roots) do
-        for _, d in ipairs(root:GetDescendants()) do
-            if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible and d.AbsoluteSize.X > 5 and isShown(d) then
-                local skip = excludeOwn and ScreenGui and d:IsDescendantOf(ScreenGui)
-                if not skip then
-                    local s = (tostring(d.Name or "") .. " " .. tostring(d.Text or "")):lower()
-                    for _, kw in ipairs(keywords) do
-                        if s:find(kw, 1, true) then return d end
-                    end
-                end
+    if not pg then return nil end
+    local function skip(d) return excludeOwn and ScreenGui and d:IsDescendantOf(ScreenGui) end
+    local function matches(str)
+        for _, kw in ipairs(keywords) do
+            if str:find(kw, 1, true) then return true end
+        end
+        return false
+    end
+    local all = pg:GetDescendants()
+    -- pass 1: real buttons
+    for _, d in ipairs(all) do
+        if d:IsA("GuiButton") and d.Visible and d.AbsoluteSize.X > 5 and isShown(d) and not skip(d) then
+            if matches(buttonLabel(d)) then return d end
+            for _, k in ipairs(d:GetDescendants()) do
+                if k:IsA("TextLabel") and k.Text ~= "" and matches(k.Text:lower()) then return d end
             end
+        end
+    end
+    -- pass 2: a button drawn as Frame + label: click where the label is
+    for _, d in ipairs(all) do
+        if d:IsA("TextLabel") and d.Visible and d.AbsoluteSize.X > 5 and d.Text ~= "" and isShown(d) and not skip(d) then
+            if matches(d.Text:lower()) then return d:FindFirstAncestorWhichIsA("GuiButton") or d end
         end
     end
     return nil
 end
 
--- Robust tap: firesignal -> VIM mouse -> (guarded) VIM touch
-local function tapButton(btn)
-    if not btn then return false end
-    if firesignal then
-        local ok = pcall(function() firesignal(btn.Activated) end)
-        if ok then return true end
-    end
+local GuiService = game:GetService("GuiService")
+
+-- A real mouse/touch click at the middle of the button (corrected for the top-bar inset)
+local function realClick(btn)
     local pos = btn.AbsolutePosition + btn.AbsoluteSize / 2
-    local okMouse = pcall(function()
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-        task.wait(0.05)
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+    local sg = btn:FindFirstAncestorWhichIsA("ScreenGui")
+    local inset = (sg and sg.IgnoreGuiInset) and Vector2.new(0, 0) or GuiService:GetGuiInset()
+    local x, y = pos.X + inset.X, pos.Y + inset.Y
+    local ok = pcall(function()
+        VIM:SendMouseMoveEvent(x, y, game)
+        task.wait(0.03)
+        VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.06)
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
     end)
-    if okMouse then return true end
-    pcall(function()
-        VIM:SendTouchEvent(0, 0, pos.X, pos.Y, true)
-        task.wait(0.08)
-        VIM:SendTouchEvent(0, 0, pos.X, pos.Y, false)
-    end)
-    return true
+    if IS_MOBILE then
+        pcall(function()
+            VIM:SendTouchEvent(0, 0, x, y)
+            task.wait(0.05)
+            VIM:SendTouchEvent(0, 2, x, y)
+        end)
+    end
+    return ok
 end
 
+-- Fire the button's own signals (works when real input is blocked)
+local function signalClick(btn)
+    local fired = false
+    if firesignal then
+        for _, sig in ipairs({"MouseButton1Down", "MouseButton1Click", "Activated", "MouseButton1Up"}) do
+            if pcall(function() firesignal(btn[sig]) end) then fired = true end
+        end
+    end
+    return fired
+end
+
+-- only = "real" | "signal" | nil (real click first, signals only if the click errored)
+local function tapButton(btn, only)
+    if not btn then return false end
+    local okReal, okSig = false, false
+    if only ~= "signal" then okReal = realClick(btn) end
+    if only == "signal" or (only == nil and not okReal) then okSig = signalClick(btn) end
+    return okReal or okSig
+end
+
+local shootCache, shootCacheT = nil, 0
 local function findShootButton()
-    -- NOTE: "scope" removed on purpose (tapping scope would not shoot)
-    return findButton({"shoot"}, true)
+    if shootCache and shootCache.Parent and shootCache.Visible and isShown(shootCache) then return shootCache end
+    shootCache = nil
+    if tick() - shootCacheT < 0.4 then return nil end
+    shootCacheT = tick()
+    shootCache = findButton({"shoot"}, true)
+    return shootCache
 end
 
 local function findCatchButton()
@@ -1165,6 +1358,40 @@ end
 
 -- Which dart names does the game use? Best-effort lookup (printed so you can verify).
 local fillDart = "Magma"
+local learned = {}
+local learnArm, learnArmedAt = nil, 0
+local learnedScopePath = nil
+local LEARN_FILE = "PetESP_learned.json"
+local HttpService = game:GetService("HttpService")
+
+local function updateWeaponLabel()
+    WeaponLabel.Text = "W:" .. tostring(CONFIG.WEAPON_NAME) .. " FILL:" .. tostring(fillDart)
+        .. " SLEEP:" .. tostring(CONFIG.SLEEP_DART)
+end
+
+local function saveLearned()
+    if not writefile then return end
+    pcall(function() writefile(LEARN_FILE, HttpService:JSONEncode(learned)) end)
+end
+
+local function loadLearned()
+    if not (isfile and readfile) then return end
+    pcall(function()
+        if isfile(LEARN_FILE) then
+            local data = HttpService:JSONDecode(readfile(LEARN_FILE))
+            if type(data) == "table" then
+                learned = data
+                if learned.weapon then CONFIG.WEAPON_NAME = learned.weapon end
+                if learned.fill then fillDart = learned.fill end
+                if learned.sleep then CONFIG.SLEEP_DART = learned.sleep end
+                learnedScopePath = learned.scope
+                print("[PetESP v8.3] loaded learned settings from " .. LEARN_FILE)
+            end
+        end
+    end)
+end
+loadLearned()
+
 local function resolveDarts()
     local function names(keyword)
         local out, seen = {}, {}
@@ -1179,14 +1406,103 @@ local function resolveDarts()
     local magma, abyss = names("magma"), names("abyss")
     print("[PetESP v8.3] magma candidates: " .. (#magma > 0 and table.concat(magma, ", ") or "none")
         .. " | abyss candidates: " .. (#abyss > 0 and table.concat(abyss, ", ") or "none"))
-    if tostring(CONFIG.FILL_DART):lower() ~= "auto" then
+    if learned.fill then
+        fillDart = learned.fill
+    elseif tostring(CONFIG.FILL_DART):lower() ~= "auto" then
         fillDart = CONFIG.FILL_DART
     elseif #magma > 0 then
         fillDart = magma[1]
     end
     print("[PetESP v8.3] fill dart = " .. tostring(fillDart) .. " | sleep dart = " .. tostring(CONFIG.SLEEP_DART))
+    updateWeaponLabel()
 end
 task.spawn(function() pcall(resolveDarts) end)
+
+-- LEARN mode: record what the game itself does when YOU use it once.
+local function onRemoteCalled(remote, method, args)
+    if not learnArm then return end
+    if tick() - learnArmedAt > 60 then learnArm = nil return end
+    if not (remote.Parent and remote.Parent.Name == "Remotes") then return end
+    local parts = {}
+    for i = 1, args.n do
+        local a = args[i]
+        parts[i] = (typeof(a) == "Instance") and a:GetFullName() or tostring(a)
+    end
+    print("[PetESP SPY] " .. remote.Name .. ":" .. method .. "(" .. table.concat(parts, ", ") .. ")")
+    if remote.Name == "Fire" and (learnArm == "fill" or learnArm == "sleep") and type(args[2]) == "string" then
+        if type(args[1]) == "string" then CONFIG.WEAPON_NAME = args[1]; learned.weapon = args[1] end
+        if learnArm == "fill" then
+            fillDart = args[2]; learned.fill = args[2]
+        else
+            CONFIG.SLEEP_DART = args[2]; learned.sleep = args[2]
+        end
+        print("[PetESP v8.3] LEARNED " .. learnArm .. " dart = " .. args[2] .. " | weapon = " .. tostring(args[1]))
+        learnArm = nil
+        saveLearned()
+        updateWeaponLabel()
+    end
+end
+
+local function installSpy()
+    GENV.PetESPSpyHandler = onRemoteCalled
+    if GENV.PetESPSpyInstalled then return true end
+    if not (hookmetamethod and getnamecallmethod) then return false end
+    local old
+    local wrap = newcclosure or function(f) return f end
+    local ok = pcall(function()
+        old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+            local m = getnamecallmethod()
+            if (m == "FireServer" or m == "InvokeServer") and GENV.PetESPSpyHandler
+               and not (checkcaller and checkcaller()) then
+                local h, args, rem = GENV.PetESPSpyHandler, table.pack(...), self
+                task.spawn(function() pcall(h, rem, m, args) end)
+            end
+            return old(self, ...)
+        end))
+    end)
+    if ok then GENV.PetESPSpyInstalled = true end
+    return ok
+end
+
+-- LEARN SCOPE: remember the GUI object under your next click
+table.insert(connections, UserInput.InputBegan:Connect(function(input)
+    if learnArm ~= "scope" then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pg then return end
+    local objs = pg:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)
+    if #objs == 0 then
+        local m = UserInput:GetMouseLocation()
+        local inset = GuiService:GetGuiInset()
+        objs = pg:GetGuiObjectsAtPosition(m.X - inset.X, m.Y - inset.Y)
+    end
+    local pick
+    for _, o in ipairs(objs) do
+        if not pick and o:IsA("GuiButton") then pick = o end
+    end
+    pick = pick or objs[1]
+    if pick then
+        local full = pick:GetFullName()
+        local rel = full:match("PlayerGui%.(.+)$")
+        if rel then
+            learnedScopePath = rel; learned.scope = rel; learnArm = nil
+            saveLearned()
+            print("[PetESP v8.3] LEARNED scope button = " .. full .. " (" .. pick.ClassName .. ")")
+        end
+    end
+end))
+
+armLearn = function(kind)
+    learnArm, learnArmedAt = kind, tick()
+    local hooked = installSpy()
+    if kind == "scope" then
+        print("[PetESP v8.3] LEARN SCOPE armed: click the real Scope button ONCE now (60s)")
+    else
+        print("[PetESP v8.3] LEARN " .. kind:upper() .. " armed: scope in and shoot ONCE with the "
+            .. (kind == "fill" and "FILL dart (Magma)" or "SLEEP dart (Abyss)") .. " (60s)")
+        if not hooked then print("[PetESP v8.3] this executor cannot hook remotes (hookmetamethod missing) - set the dart names in CONFIG by hand") end
+    end
+end
 
 -- Dots above an animal's head (best effort): how many hit circles it has
 local function countHitDots(pet)
@@ -1232,16 +1548,34 @@ local function waitAimUi(seconds)
     return false
 end
 
--- Auto-scope: tap the Scope button (right side of the screen); fall back to the EnterAim remote
+local function resolveScopeButton()
+    if not learnedScopePath then return nil end
+    local cur = LocalPlayer:FindFirstChild("PlayerGui")
+    for seg in learnedScopePath:gmatch("[^%.]+") do
+        cur = cur and cur:FindFirstChild(seg)
+    end
+    if cur and cur:IsA("GuiObject") and isShown(cur) then return cur end
+    return nil
+end
+
+-- Auto-scope: click the Scope button (learned one first). Each method is verified by the SHOOT
+-- button showing up, so we never click twice and toggle the scope back off.
 local function autoScope()
     if findShootButton() then return true end
-    local b = findButton({"scope"}, true)
+    local b = resolveScopeButton() or findButton({"scope"}, true)
     if b then
-        tapButton(b)
-        if waitAimUi(1.2) then return true end
+        print("[PetESP v8.3] scope button: " .. b:GetFullName())
+        tapButton(b, "real")
+        if waitAimUi(1.0) then return true end
+        tapButton(b, "signal")
+        if waitAimUi(1.0) then return true end
+    else
+        print("[PetESP v8.3] scope button not found - press LEARN SCOPE and click it once")
     end
     enterAimMode(true)
-    return waitAimUi(1.5)
+    local ok = waitAimUi(1.5)
+    if not ok then print("[PetESP v8.3] scope did not open, or the SHOOT button was not detected") end
+    return ok
 end
 
 RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 1, function()
@@ -1263,6 +1597,7 @@ end)
 -- -> finish with the sleep dart (Abyss) -> animal goes down -> main loop collects it.
 task.spawn(function()
     local scopedFor = nil
+    local scopeTriedAt = 0
     local shots = setmetatable({}, {__mode = "k"})
     local lastSleepShot = 0
     while RUNNING do
@@ -1283,7 +1618,9 @@ task.spawn(function()
             end
 
             -- 2) open the scope (once per target, or again if the aim screen closed)
-            if scopedFor ~= target or not findShootButton() then
+            if CONFIG.AUTO_SCOPE and (scopedFor ~= target
+               or (tick() - scopeTriedAt > 6 and not findShootButton())) then
+                scopeTriedAt = tick()
                 autoScope()
                 scopedFor = target
                 if not RUNNING or collecting or lockTarget ~= target then return end
@@ -1318,7 +1655,10 @@ end)
 debugDump = function()
     local function nm(i) return i and i:GetFullName() or "none" end
     print("[PetESP v8.3] ---- DEBUG ----")
-    print("world=" .. tostring(currentWorldName) .. " pets=" .. #cachedPets .. " FTC=" .. tostring(freeToCatchName))
+    local lp = 0
+    for _ in pairs(labelPets) do lp = lp + 1 end
+    print("world=" .. tostring(currentWorldName) .. " pets=" .. #cachedPets .. " labelPets=" .. lp
+        .. " FTC=" .. tostring(freeToCatchName))
     print("sleepDart=" .. tostring(CONFIG.SLEEP_DART) .. " fillDart=" .. tostring(fillDart))
     print("scopeButton=" .. nm(findButton({"scope"}, true)) .. " | shootButton=" .. nm(findShootButton()))
     local me = getPlayerPos()
@@ -1332,7 +1672,8 @@ debugDump = function()
     end
     if nearest then
         print("nearest=" .. nearest:GetFullName() .. " dist=" .. math.floor(nd)
-            .. " downed=" .. tostring(isDowned(nearest)) .. " hitDots=" .. tostring(countHitDots(nearest)))
+            .. " downed=" .. tostring(isDowned(nearest)) .. " hitDots=" .. tostring(countHitDots(nearest))
+            .. " native=" .. tostring(nativeInfo(nearest) and nativeInfo(nearest).text))
         local okA, attrs = pcall(function() return nearest:GetAttributes() end)
         if okA then for k, v in pairs(attrs) do print("  attr " .. k .. " = " .. tostring(v)) end end
     end
@@ -1414,8 +1755,17 @@ task.spawn(function()
             local keep = {}
 
             if CONFIG.ESP_ENABLED then
+                local espShow, inShow, extra = {}, {}, {}
+                for _, d in ipairs(downedList) do extra[d] = true end
+                if lockTarget then extra[lockTarget] = true end
                 for i = 1, math.min(topN, #espCandidates) do
-                    local pet = espCandidates[i]
+                    inShow[espCandidates[i]] = true
+                    table.insert(espShow, espCandidates[i])
+                end
+                for _, pet in ipairs(espCandidates) do      -- the locked / downed animal always gets ESP
+                    if extra[pet] and not inShow[pet] then table.insert(espShow, pet) end
+                end
+                for _, pet in ipairs(espShow) do
                     keep[pet] = true
                     local center = getPetCenter(pet)
                     local root = findRootPart(pet)
@@ -1439,7 +1789,9 @@ task.spawn(function()
                             if downed then
                                 newText = getPetName(pet) .. "  FREE!"
                             else
-                                newText = getPetName(pet) .. "  " .. formatValue(getPetValue(pet)) .. "  " .. math.floor(dist) .. "m"
+                                local ni = nativeInfo(pet)
+                                local vtxt = ni and (formatValue(ni.value) .. " $/s") or ("$" .. formatValue(getPetValue(pet)))
+                                newText = getPetName(pet) .. "  " .. vtxt .. "  " .. math.floor(dist) .. "m"
                             end
                             if newText ~= esp.lastText then
                                 esp.label.Text = newText
