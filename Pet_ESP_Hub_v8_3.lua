@@ -11,6 +11,10 @@
 --   * X button = full shutdown (every loop stops, ESP/highlights/GUI destroyed).
 --     "-" button = hide the panel; tap the small PET bubble to bring it back.
 --   * Buttons use .Activated so they work on touch.
+-- v8.3.3:
+--   * Mutations (Gold / Diamond / Rainbow / Void): coloured + tagged in ESP, always shown, aimed at first.
+--   * Carry-back: reads the sleep countdown (free-to-catch banner / timer on the animal / dart estimate),
+--     skips animals about to wake, picks the best one first, retries the pick-up, shows time left on ESP.
 -- v8.3.2:
 --   * ESP value = the game's own overhead label ("LEGENDARY . 135SP $/S"), parsed with K/M/B/T/Qa/Qi/Sx/Sp/Oc/No/Dc.
 --   * Animals are also discovered through that label (any folder), locked/downed animals always get ESP.
@@ -97,6 +101,14 @@ local CONFIG = {
     FILL_SHOTS      = 5,             -- fill-dart shots before the sleep dart when the circles can't be read
     SLEEP_RETRY     = 2.0,           -- seconds between sleep-dart shots (saves your Abyss darts)
     AUTO_SCOPE      = true,
+
+    -- v8.3.3
+    AIM_MUTATIONS_FIRST = true,      -- Void > Rainbow > Diamond > Gold are targeted before normal animals
+    AIM_ONLY_MUTATIONS  = false,     -- true = ignore normal animals completely
+    MIN_SLEEP_LEFT  = 8,             -- skip a downed animal that wakes in less than this many seconds
+    COLLECT_ATTEMPTS = 3,            -- pick-up tries per animal while it is still asleep
+    TP_BASE_EVEN_IF_UNVERIFIED = true,
+    SLEEP_SECONDS   = { abyss = 125, magma = 100, glowing = 57, coral = 40, lance = 22 },  -- from the dart shop
     LABEL_DISCOVERY = true,          -- find wild animals by their overhead "$/S" label (any folder)
     LABEL_NEEDS_ODDS = true,         -- ...and require the "1 in N" line, so base/owned pets are not picked up
     FIRE_ORIGIN     = "camera",      -- "camera" or "character" - origin used to build the aim vector
@@ -160,6 +172,10 @@ local debugDump      = nil                         -- assigned later
 local armLearn       = nil                         -- assigned later
 local labelPets      = {}                          -- animals found through their overhead label
 local nativeCache    = setmetatable({}, {__mode = "k"})
+local freeToCatchSecs = nil                        -- countdown shown on the "Free to catch" banner
+local downedAt       = setmetatable({}, {__mode = "k"})
+local sleepShotAt    = setmetatable({}, {__mode = "k"})
+local skipLogged     = setmetatable({}, {__mode = "k"})
 
 --------------------------------------------------------------------------------
 -- Real game remotes (confirmed):
@@ -383,6 +399,41 @@ local function getRarityColor(model)
     return RARITY_COLORS.Common
 end
 
+local MUTATION_COLORS = {
+    Gold    = Color3.fromRGB(255, 200, 0),
+    Diamond = Color3.fromRGB(120, 230, 255),
+    Rainbow = Color3.fromRGB(255, 105, 220),
+    Void    = Color3.fromRGB(150, 60, 255),
+}
+local MUTATION_RANK = { Void = 4, Rainbow = 3, Diamond = 2, Gold = 1 }
+
+-- Mutation = a whole word in the attribute / model name / pet name / overhead label
+-- ("SeaTurtleRainbow" -> "Sea Turtle Rainbow"; "Goldfish" does NOT count as Gold)
+local function getMutation(model)
+    local attr = getAttr(model, "Mutation") or getAttr(model, "Variant") or getAttr(model, "Mod")
+    local texts = { attr and tostring(attr) or "", model.Name, getPetName(model) }
+    local ni = nativeInfo(model)
+    if ni and ni.text then table.insert(texts, ni.text) end
+    for _, txt in ipairs(texts) do
+        local spaced = txt:gsub("(%l)(%u)", "%1 %2"):lower()
+        for word in spaced:gmatch("%a+") do
+            local key = word:sub(1, 1):upper() .. word:sub(2)
+            if MUTATION_RANK[key] then return key end
+        end
+    end
+    return nil
+end
+
+local function mutationRank(model)
+    local m = getMutation(model)
+    return m and MUTATION_RANK[m] or 0
+end
+
+local function fmtTime(sec)
+    sec = math.max(0, math.floor(sec))
+    return string.format("%d:%02d", math.floor(sec / 60), sec % 60)
+end
+
 local function isInBase(pos)
     if not pos then return false end
     if (pos - CONFIG.BASE_POS).Magnitude <= CONFIG.BASE_RADIUS then return true end
@@ -437,6 +488,7 @@ end
 
 local function updateFreeToCatch()
     freeToCatchName = nil
+    freeToCatchSecs = nil
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
     if not pg then return end
     for _, d in ipairs(pg:GetDescendants()) do
@@ -448,8 +500,21 @@ local function updateFreeToCatch()
                     for _, sib in ipairs(parent:GetChildren()) do
                         if sib ~= d and sib:IsA("TextLabel") and sib.Text then
                             local low = sib.Text:lower()
-                            if #low >= 3 and not low:find("catch", 1, true) and not low:find("free", 1, true) then
+                            if #low >= 3 and not low:find("catch", 1, true) and not low:find("free", 1, true)
+                               and not low:match("^%s*%d+:%d%d%s*$") then
                                 freeToCatchName = sib.Text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+                                break
+                            end
+                        end
+                    end
+                end
+                local scope = (d.Parent and d.Parent.Parent) or d.Parent
+                if scope then
+                    for _, tl in ipairs(scope:GetDescendants()) do
+                        if tl:IsA("TextLabel") then
+                            local mm, ss = tl.Text:match("^%s*(%d+):(%d%d)%s*$")
+                            if mm then
+                                freeToCatchSecs = tonumber(mm) * 60 + tonumber(ss)
                                 break
                             end
                         end
@@ -465,20 +530,21 @@ local function updateFreeToCatch()
     end
 end
 
+local function matchesFTC(model)
+    if not (freeToCatchName and freeToCatchName ~= "") then return false end
+    local pn = normAlnum(getPetName(model))
+    if #pn < 3 then return false end
+    local ftc = normAlnum(freeToCatchName)
+    return (ftc:find(pn, 1, true) ~= nil) or (pn:find(ftc, 1, true) ~= nil)
+end
+
 local function isDowned(model)
     local nm = model.Name:lower()
     if nm:find("downed", 1, true) then return true end
 
     -- Free to catch banner name match (guarded against empty pet name)
     if freeToCatchName and freeToCatchName ~= "" then
-        -- compare with spaces/punctuation stripped: "SeaTurtleRainbow" vs "Sea Turtle Rainbow COMMON · Coral Reef"
-        local pn = normAlnum(getPetName(model))
-        if #pn >= 3 then
-            local ftc = normAlnum(freeToCatchName)
-            if ftc:find(pn, 1, true) or pn:find(ftc, 1, true) then
-                return true
-            end
-        end
+        if matchesFTC(model) then return true end
     end
 
     local state = getAttr(model, "State")
@@ -516,6 +582,29 @@ local function isDowned(model)
     end
 
     return false
+end
+
+local function dartSleepSeconds(dartName)
+    local l = tostring(dartName):lower()
+    for key, sec in pairs(CONFIG.SLEEP_SECONDS) do
+        if l:find(key, 1, true) then return sec end
+    end
+    return 60
+end
+
+-- Seconds until a downed animal wakes (nil = unknown). Best source first:
+-- 1) a timer label on the animal, 2) the free-to-catch banner countdown, 3) our own estimate.
+local function sleepLeft(pet)
+    for _, d in ipairs(pet:GetDescendants()) do
+        if d:IsA("TextLabel") then
+            local mm, ss = d.Text:match("^%s*(%d+):(%d%d)%s*$")
+            if mm then return tonumber(mm) * 60 + tonumber(ss) end
+        end
+    end
+    if freeToCatchSecs and matchesFTC(pet) then return freeToCatchSecs end
+    local base = sleepShotAt[pet] or downedAt[pet]
+    if base then return dartSleepSeconds(CONFIG.SLEEP_DART) - (tick() - base) end
+    return nil
 end
 
 --------------------------------------------------------------------------------
@@ -1642,6 +1731,7 @@ task.spawn(function()
             if fired then
                 shots[target] = n + 1
                 lastShotTarget = target
+                if dart == CONFIG.SLEEP_DART then sleepShotAt[target] = sleepShotAt[target] or tick() end
             else
                 local btn = findShootButton()      -- fallback: tap SHOOT (uses the equipped dart)
                 if btn then tapButton(btn); lastShotTarget = target else clickCenter() end
@@ -1705,7 +1795,10 @@ task.spawn(function()
                     if center and (center - playerPos).Magnitude < CONFIG.ESP_MAX_DIST then
                         local downed = isDowned(pet)
                         if not isOwnedPet(pet) and not isInBase(center) then
-                            if downed then table.insert(downedList, pet) end
+                            if downed then
+                                table.insert(downedList, pet)
+                                downedAt[pet] = downedAt[pet] or tick()
+                            end
                             table.insert(espCandidates, pet)
                             if not downed and isWildAnimal(pet) then table.insert(aimCandidates, pet) end
                         end
@@ -1734,10 +1827,15 @@ task.spawn(function()
                     table.insert(inRange, pet)
                 end
             end
+            if CONFIG.AIM_ONLY_MUTATIONS then
+                local f = {}
+                for _, pet in ipairs(inRange) do
+                    if mutationRank(pet) > 0 then table.insert(f, pet) end
+                end
+                inRange = f
+            end
             local pick = nil
-            if lockTarget and lockTarget.Parent and table.find(inRange, lockTarget) then
-                pick = lockTarget
-            elseif #inRange > 0 then
+            if #inRange > 0 then
                 if CONFIG.AIM_PRIORITY == "Value" then
                     table.sort(inRange, function(a, b) return getPetValue(a) > getPetValue(b) end)
                 else
@@ -1748,6 +1846,19 @@ task.spawn(function()
                     end)
                 end
                 pick = inRange[1]
+                if CONFIG.AIM_MUTATIONS_FIRST then
+                    local bestRank = mutationRank(pick)
+                    for _, pet in ipairs(inRange) do
+                        local r = mutationRank(pet)
+                        if r > bestRank then bestRank, pick = r, pet end
+                    end
+                end
+                -- sticky: keep the current target unless a rarer mutation showed up and we have not hit it yet
+                local cur = lockTarget
+                if cur and cur.Parent and table.find(inRange, cur)
+                   and not (CONFIG.AIM_MUTATIONS_FIRST and cur ~= lastShotTarget and mutationRank(pick) > mutationRank(cur)) then
+                    pick = cur
+                end
             end
             lockTarget = (CONFIG.AUTO_AIM and not collecting) and pick or nil
 
@@ -1758,6 +1869,9 @@ task.spawn(function()
                 local espShow, inShow, extra = {}, {}, {}
                 for _, d in ipairs(downedList) do extra[d] = true end
                 if lockTarget then extra[lockTarget] = true end
+                for _, pet in ipairs(espCandidates) do
+                    if mutationRank(pet) > 0 then extra[pet] = true end
+                end
                 for i = 1, math.min(topN, #espCandidates) do
                     inShow[espCandidates[i]] = true
                     table.insert(espShow, espCandidates[i])
@@ -1772,7 +1886,9 @@ task.spawn(function()
                     if center and root then
                         local dist = (center - playerPos).Magnitude
                         local downed = isDowned(pet)
-                        local rarityColor = getRarityColor(pet)
+                        local mut = getMutation(pet)
+                        local tag = mut and ("[" .. mut:upper() .. "] ") or ""
+                        local rarityColor = (mut and MUTATION_COLORS[mut]) or getRarityColor(pet)
 
                         local hl = getHighlight(pet, downed, rarityColor)
                         if hl then
@@ -1787,11 +1903,12 @@ task.spawn(function()
                             esp.gui.Adornee = root
                             local newText
                             if downed then
-                                newText = getPetName(pet) .. "  FREE!"
+                                local left = sleepLeft(pet)
+                                newText = tag .. getPetName(pet) .. "  FREE!" .. (left and (" " .. fmtTime(left)) or "")
                             else
                                 local ni = nativeInfo(pet)
                                 local vtxt = ni and (formatValue(ni.value) .. " $/s") or ("$" .. formatValue(getPetValue(pet)))
-                                newText = getPetName(pet) .. "  " .. vtxt .. "  " .. math.floor(dist) .. "m"
+                                newText = tag .. getPetName(pet) .. "  " .. vtxt .. "  " .. math.floor(dist) .. "m"
                             end
                             if newText ~= esp.lastText then
                                 esp.label.Text = newText
@@ -1824,18 +1941,32 @@ task.spawn(function()
                     .. (freeToCatchName and (" | FTC: " .. freeToCatchName) or "")
             end
 
-            -- Collect downed wild animals, then go to the base spot
+            -- Collect downed animals (best first) and carry them to the base spot before they wake
             if CONFIG.AUTO_COLLECT and #downedList > 0 and not collecting
                and tick() - lastCollect >= CONFIG.COLLECT_COOLDOWN then
                 local fresh = {}
                 for _, pet in ipairs(downedList) do
                     local t = collectTried[pet]
-                    if not t or tick() - t > 25 then table.insert(fresh, pet) end   -- no endless retry on one pet
+                    if not t or tick() - t > 25 then
+                        local left = sleepLeft(pet)
+                        if left and left < CONFIG.MIN_SLEEP_LEFT then
+                            if not skipLogged[pet] then
+                                skipLogged[pet] = true
+                                print("[PetESP v8.3] skip " .. getPetName(pet) .. ": wakes in " .. math.max(0, math.floor(left)) .. "s")
+                            end
+                        else
+                            table.insert(fresh, pet)
+                        end
+                    end
                 end
                 if #fresh > 0 then
                     lastCollect = tick()
                     table.sort(fresh, function(a, b)
                         if (a == lastShotTarget) ~= (b == lastShotTarget) then return a == lastShotTarget end
+                        local ra, rb = mutationRank(a), mutationRank(b)
+                        if ra ~= rb then return ra > rb end
+                        local va, vb = getPetValue(a), getPetValue(b)
+                        if va ~= vb then return va > vb end
                         local ca = getPetCenter(a) or Vector3.new()
                         local cb = getPetCenter(b) or Vector3.new()
                         return (ca - playerPos).Magnitude < (cb - playerPos).Magnitude
@@ -1844,10 +1975,29 @@ task.spawn(function()
                     collectTried[target] = tick()
                     collecting = true
                     lockTarget = nil
-                    print("[PetESP v8.3] Auto-collect: " .. getPetName(target))
-                    pcall(tryCollectPet, target)
-                    if RUNNING and CONFIG.TP_BASE_AFTER_COLLECT then
-                        task.wait(0.4)
+                    local left0 = sleepLeft(target)
+                    print("[PetESP v8.3] Auto-collect: " .. getPetName(target)
+                        .. (left0 and (" (" .. fmtTime(left0) .. " left)") or ""))
+
+                    local parentBefore = target.Parent
+                    local carried = false
+                    for _ = 1, CONFIG.COLLECT_ATTEMPTS do
+                        if not RUNNING then break end
+                        pcall(tryCollectPet, target)
+                        task.wait(0.3)
+                        local char = LocalPlayer.Character
+                        local carrier = getAttr(target, "Carrier") or getAttr(target, "CarriedBy") or getAttr(target, "Holder")
+                        carried = (not target.Parent) or target.Parent ~= parentBefore
+                            or (char ~= nil and target:IsDescendantOf(char))
+                            or (carrier ~= nil and (tostring(carrier) == LocalPlayer.Name or carrier == LocalPlayer.UserId))
+                        if carried then break end
+                        local left = sleepLeft(target)
+                        if left and left < CONFIG.MIN_SLEEP_LEFT then break end
+                    end
+                    print("[PetESP v8.3] pick-up " .. (carried and "confirmed" or "unverified"))
+
+                    if RUNNING and CONFIG.TP_BASE_AFTER_COLLECT and (carried or CONFIG.TP_BASE_EVEN_IF_UNVERIFIED) then
+                        task.wait(0.2)
                         teleportTo(CONFIG.BASE_POS)
                         task.wait(0.6)
                     end
