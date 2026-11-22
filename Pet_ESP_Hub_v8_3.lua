@@ -11,6 +11,11 @@
 --   * X button = full shutdown (every loop stops, ESP/highlights/GUI destroyed).
 --     "-" button = hide the panel; tap the small PET bubble to bring it back.
 --   * Buttons use .Activated so they work on touch.
+-- v8.3.10:
+--   * Auto-fire no longer needs the camera pointed at the animal: the Fire remote gets the direction from your
+--     character to the animal (FIRE_ORIGIN="character"), the camera is left alone (CAMERA_LOCK=false), scope not required.
+--   * Sleeping/downed animals up to COLLECT_MAX_DIST (2000) are collected without you being near; sleep-dart shots
+--     you fire by hand are matched to the animal you hit so far-away sleepers count as downed.
 -- v8.3.9 (from the DEBUG next to a sleeping animal):
 --   * The sleeping animal is Workspace.ClientPets.<Name> with a BillboardGui "SleepTimer" whose text is "57,1"
 --     (COMMA decimal). Ring/timer parsing now accepts "57,1" / "57.1" / "m:ss" and any billboard named *Sleep*.
@@ -115,6 +120,7 @@ local CONFIG = {
     ESP_MODE      = "Nearest",   -- "Nearest" or "Value"
     TOP_N         = 15,
     ESP_MAX_DIST  = 500,
+    COLLECT_MAX_DIST = 2000,         -- sleeping/downed animals this far away are still collected (no need to be near)
     HIDE_DIST     = 25,
     SCAN_INTERVAL = 2.5,
     ESP_INTERVAL  = 0.3,
@@ -134,7 +140,7 @@ local CONFIG = {
     SLEEP_RETRY     = 2.0,           -- seconds between sleep-dart shots (saves your Abyss darts)
     AUTO_SCOPE      = true,
     GUI_SCALE       = "auto",                         -- "auto" = fit the screen, or a number like 0.6
-    REQUIRE_SCOPE   = true,          -- only shoot while the scope view is open (saves your darts)
+    REQUIRE_SCOPE   = false,         -- Fire remote works without the scope view; set true to only shoot while scoped
     AUTO_BASE_ON_CARRY = true,       -- picked up a downed animal (by you or the script) -> go to BASE_POS
     CARRY_MAX_SECS  = 60,            -- aiming stays paused at most this long per carry
     STILL_SECS      = 1.5,           -- an animal we slept-darted that stands still this long counts as downed
@@ -150,8 +156,9 @@ local CONFIG = {
     SLEEP_SECONDS   = { abyss = 125, magma = 100, glowing = 57, coral = 40, lance = 22 },  -- from the dart shop
     LABEL_DISCOVERY = true,          -- find wild animals by their overhead "$/S" label (any folder)
     LABEL_NEEDS_ODDS = true,         -- ...and require the "1 in N" line, so base/owned pets are not picked up
-    FIRE_ORIGIN     = "camera",      -- "camera" or "character" - origin used to build the aim vector
+    FIRE_ORIGIN     = "character",      -- "camera" or "character" - origin used to build the aim vector
     FIRE_INTERVAL   = 0.35,          -- seconds between Fire remote calls while locked on
+    CAMERA_LOCK     = false,         -- false = never touch the camera; the Fire remote gets the direction itself
     AIM_LOCK        = true,          -- glue the camera to the target every frame
     AIM_LOCK_ALPHA  = 0.45,          -- 0.1 = slow/smooth, 1.0 = instant snap
     ZOOM_ON_AIM     = true,          -- PC: scroll wheel to enter aim/zoom like a human
@@ -1656,7 +1663,33 @@ end
 task.spawn(function() pcall(resolveDarts) end)
 
 -- LEARN mode: record what the game itself does when YOU use it once.
+local function markManualSleepShot(dir)
+    local cam = Workspace.CurrentCamera
+    if not (cam and typeof(dir) == "Vector3" and dir.Magnitude > 0.01) then return end
+    local origins = {cam.CFrame.Position}
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then table.insert(origins, hrp.Position) end
+    local best, bestAng = nil, math.rad(4)
+    for _, pet in ipairs(cachedPets) do
+        if pet and pet.Parent and not isOwnedPet(pet) then
+            local c = getPetCenter(pet)
+            if c then
+                for _, o in ipairs(origins) do
+                    local v = c - o
+                    if v.Magnitude > 1 then
+                        local a = math.acos(math.clamp(v.Unit:Dot(dir.Unit), -1, 1))
+                        if a < bestAng then best, bestAng = pet, a end
+                    end
+                end
+            end
+        end
+    end
+    if best then sleepShotAt[best] = sleepShotAt[best] or tick() end
+end
+
 local function onRemoteCalled(remote, method, args)
+    if remote.Name == "Fire" and args[2] == CONFIG.SLEEP_DART then pcall(markManualSleepShot, args[3]) end
     if remote.Name == "Equip" and args[1] == "Dart" and type(args[2]) == "string" then equippedDart = args[2] end
     if not learnArm then return end
     if tick() - learnArmedAt > 60 then learnArm = nil return end
@@ -1913,7 +1946,7 @@ local function autoScope()
 end
 
 RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 1, function()
-    if not RUNNING or not CONFIG.AUTO_AIM then return end
+    if not RUNNING or not CONFIG.AUTO_AIM or not CONFIG.CAMERA_LOCK then return end
     local target = lockTarget
     if not (target and target.Parent) then return end
     local cam = Workspace.CurrentCamera
@@ -2191,7 +2224,9 @@ task.spawn(function()
             for _, pet in ipairs(allPets) do
                 if pet and pet.Parent then
                     local center = getPetCenter(pet)
-                    if center and (center - playerPos).Magnitude < CONFIG.ESP_MAX_DIST then
+                    local dist = center and (center - playerPos).Magnitude
+                    if center and dist < math.max(CONFIG.ESP_MAX_DIST, CONFIG.COLLECT_MAX_DIST) then
+                        local near = dist < CONFIG.ESP_MAX_DIST
                         local an = anchorPos[pet]
                         if not an or (center - an).Magnitude > 0.6 then
                             anchorPos[pet] = center
@@ -2203,8 +2238,8 @@ task.spawn(function()
                                 table.insert(downedList, pet)
                                 downedAt[pet] = downedAt[pet] or tick()
                             end
-                            table.insert(espCandidates, pet)
-                            if not downed and isWildAnimal(pet) then table.insert(aimCandidates, pet) end
+                            if near then table.insert(espCandidates, pet) end
+                            if near and not downed and isWildAnimal(pet) then table.insert(aimCandidates, pet) end
                         end
                     end
                 end
