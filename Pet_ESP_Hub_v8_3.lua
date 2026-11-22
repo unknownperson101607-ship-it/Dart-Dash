@@ -11,6 +11,15 @@
 --   * X button = full shutdown (every loop stops, ESP/highlights/GUI destroyed).
 --     "-" button = hide the panel; tap the small PET bubble to bring it back.
 --   * Buttons use .Activated so they work on touch.
+-- v8.3.6 (from your SPY/DEBUG logs):
+--   * Scope button = PlayerGui.AimGui.Root.ScopeButton. "Scoped" is now detected from the scope view itself
+--     (reticle / BACK button), NOT from the SHOOT button (it is visible but greyed out when not scoped).
+--   * Darts are switched with Remotes.Equip:FireServer("Dart", name) before every Fire (the game does the same).
+--   * Defaults: FILL_DART = "Magma", SLEEP_DART = "Abyss" (matches Dart_Magma / Dart_Abyss in the game).
+--   * Shots are only fired while scoped (REQUIRE_SCOPE). Catch-button search only taps real buttons.
+--   * Values: the info label ("LEGENDARY . 135SP $/S") only exists while an animal is focused, so the value is
+--     learned per species the first time we focus one and remembered (saved with the learned settings).
+--   * DEBUG now lists nearby animals with flags, the GUI labels it can see, and the AimGui tree.
 -- v8.3.5:
 --   * Far-away sleepers (ring not rendered): an animal we hit with the sleep dart that then stands still is
 --     treated as downed; the collector teleports next to it, and if no ring appears there it goes back to aiming.
@@ -105,11 +114,12 @@ local CONFIG = {
     -- v8.3 remotes + aim lock
     USE_REMOTE_FIRE = true,          -- Remotes.EnterAim + Remotes.Fire (the real way this game shoots)
     WEAPON_NAME     = "RlyehTrident",-- <<< change to the weapon you use
-    SLEEP_DART      = "Abysse",      -- dart that puts the animal to sleep (Abyss Harpoon, sleeps 125s)
-    FILL_DART       = "auto",        -- cheap dart that fills the hit circles (Magma Harpoon). "auto" = look it up, else "Magma"
+    SLEEP_DART      = "Abyss",       -- dart that puts the animal to sleep (Abyss Harpoon, sleeps 125s)
+    FILL_DART       = "Magma",        -- cheap dart that fills the hit circles (Magma Harpoon). "auto" = look it up, else "Magma"
     FILL_SHOTS      = 5,             -- fill-dart shots before the sleep dart when the circles can't be read
     SLEEP_RETRY     = 2.0,           -- seconds between sleep-dart shots (saves your Abyss darts)
     AUTO_SCOPE      = true,
+    REQUIRE_SCOPE   = true,          -- only shoot while the scope view is open (saves your darts)
     AUTO_BASE_ON_CARRY = true,       -- picked up a downed animal (by you or the script) -> go to BASE_POS
     CARRY_MAX_SECS  = 60,            -- aiming stays paused at most this long per carry
     STILL_SECS      = 1.5,           -- an animal we slept-darted that stands still this long counts as downed
@@ -190,6 +200,8 @@ local freeToCatchSecs = nil                        -- countdown shown on the "Fr
 local downedAt       = setmetatable({}, {__mode = "k"})
 local sleepShotAt    = setmetatable({}, {__mode = "k"})
 local skipLogged     = setmetatable({}, {__mode = "k"})
+local speciesValue   = {}                          -- learned "$/s" per species(+mutation)
+local valueFromCache = nil
 local anchorPos      = setmetatable({}, {__mode = "k"})   -- where an animal last "stood"
 local anchorT        = setmetatable({}, {__mode = "k"})   -- since when it has stood there
 local prevPetPos     = setmetatable({}, {__mode = "k"})
@@ -319,6 +331,22 @@ local function parseIncome(text)
     return num * mult
 end
 
+-- The info label shown while an animal is focused: "LEGENDARY . 135SP $/S" (starts with a rarity word,
+-- so the HUD income label "13.2DC $/S" does not match)
+local function parseFocusLabel(text)
+    local t = text:lower()
+    local word, num, suf = t:match("^%s*(%a+)[^%w]+([%d%.,]+)%s*(%a*)%s*%$%s*/%s*s")
+    if not word then return nil end
+    local n = tonumber((num:gsub(",", "")))
+    if not n then return nil end
+    local mult = 1
+    if suf ~= "" then
+        mult = SUFFIX_MULT[suf]
+        if not mult then return nil end
+    end
+    return n * mult, word
+end
+
 local function nativeInfo(model)
     local c = nativeCache[model]
     if c and tick() - c.t < 1.5 then return c.info end
@@ -373,6 +401,10 @@ end
 local function getPetValue(model)
     local ni = nativeInfo(model)
     if ni and ni.value then return ni.value end
+    if valueFromCache then
+        local cv = valueFromCache(model)
+        if cv then return cv end
+    end
     local v = getAttr(model, "Value") or getAttr(model, "Price") or getAttr(model, "Worth")
     if type(v) == "number" and v > 0 then return v end
     local iv = model:FindFirstChild("Value") or model:FindFirstChild("Price")
@@ -442,6 +474,12 @@ local function getMutation(model)
         end
     end
     return nil
+end
+
+valueFromCache = function(model)
+    local sp = getAttr(model, "Species") or getPetName(model)
+    local mut = getMutation(model)
+    return speciesValue[tostring(sp) .. (mut and ("|" .. mut) or "")]
 end
 
 local function mutationRank(model)
@@ -1329,7 +1367,7 @@ local function buttonLabel(d)
     return str:lower()
 end
 
-local function findButton(keywords, excludeOwn)
+local function findButton(keywords, excludeOwn, buttonsOnly)
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
     if not pg then return nil end
     local function skip(d) return excludeOwn and ScreenGui and d:IsDescendantOf(ScreenGui) end
@@ -1349,6 +1387,7 @@ local function findButton(keywords, excludeOwn)
             end
         end
     end
+    if buttonsOnly then return nil end
     -- pass 2: a button drawn as Frame + label: click where the label is
     for _, d in ipairs(all) do
         if d:IsA("TextLabel") and d.Visible and d.AbsoluteSize.X > 5 and d.Text ~= "" and isShown(d) and not skip(d) then
@@ -1414,7 +1453,7 @@ local function findShootButton()
 end
 
 local function findCatchButton()
-    return findButton({"catch", "collect", "tame"}, true)
+    return findButton({"catch", "collect", "tame"}, true, true)
 end
 
 local function tryCollectPet(pet)
@@ -1495,6 +1534,7 @@ end
 -- Which dart names does the game use? Best-effort lookup (printed so you can verify).
 local fillDart = "Magma"
 local learned = {}
+local equippedDart = nil
 local learnArm, learnArmedAt = nil, 0
 local learnedScopePath = nil
 local LEARN_FILE = "PetESP_learned.json"
@@ -1507,6 +1547,7 @@ end
 
 local function saveLearned()
     if not writefile then return end
+    learned.values = speciesValue
     pcall(function() writefile(LEARN_FILE, HttpService:JSONEncode(learned)) end)
 end
 
@@ -1521,12 +1562,16 @@ local function loadLearned()
                 if learned.fill then fillDart = learned.fill end
                 if learned.sleep then CONFIG.SLEEP_DART = learned.sleep end
                 learnedScopePath = learned.scope
+                if type(learned.values) == "table" then
+                    for k, v in pairs(learned.values) do speciesValue[k] = v end
+                end
                 print("[PetESP v8.3] loaded learned settings from " .. LEARN_FILE)
             end
         end
     end)
 end
 loadLearned()
+learnedScopePath = learnedScopePath or "AimGui.Root.ScopeButton"
 
 local function resolveDarts()
     local function names(keyword)
@@ -1556,6 +1601,7 @@ task.spawn(function() pcall(resolveDarts) end)
 
 -- LEARN mode: record what the game itself does when YOU use it once.
 local function onRemoteCalled(remote, method, args)
+    if remote.Name == "Equip" and args[1] == "Dart" and type(args[2]) == "string" then equippedDart = args[2] end
     if not learnArm then return end
     if tick() - learnArmedAt > 60 then learnArm = nil return end
     if not (remote.Parent and remote.Parent.Name == "Remotes") then return end
@@ -1628,6 +1674,8 @@ table.insert(connections, UserInput.InputBegan:Connect(function(input)
     end
 end))
 
+task.spawn(function() pcall(installSpy) end)   -- track the game's own Equip calls from the start
+
 armLearn = function(kind)
     learnArm, learnArmedAt = kind, tick()
     local hooked = installSpy()
@@ -1674,16 +1722,6 @@ local function fillShotsFor(pet)
     return CONFIG.FILL_SHOTS
 end
 
-local function waitAimUi(seconds)
-    local t0 = tick()
-    while tick() - t0 < seconds do
-        if findShootButton() then return true end
-        task.wait(0.1)
-        if not RUNNING then return false end
-    end
-    return false
-end
-
 local function resolveScopeButton()
     if not learnedScopePath then return nil end
     local cur = LocalPlayer:FindFirstChild("PlayerGui")
@@ -1694,23 +1732,70 @@ local function resolveScopeButton()
     return nil
 end
 
--- Auto-scope: click the Scope button (learned one first). Each method is verified by the SHOOT
--- button showing up, so we never click twice and toggle the scope back off.
+-- Are we in the scope view? NOT the SHOOT button: it is visible (greyed out) even when not scoped.
+-- Scoped = the BACK button of the aim UI exists, or the reticle overlay is up while the SCOPE button is gone.
+local function isScoped()
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pg then return false end
+    local gui = pg:FindFirstChild("AimGui")
+    if gui and gui:IsA("ScreenGui") and gui.Enabled then
+        for _, d in ipairs(gui:GetDescendants()) do
+            if d:IsA("GuiButton") and d.Visible and d.AbsoluteSize.X > 5 and isShown(d) then
+                if buttonLabel(d):find("back", 1, true) then return true end
+                for _, k in ipairs(d:GetDescendants()) do
+                    if k:IsA("TextLabel") and k.Text:lower():find("back", 1, true) then return true end
+                end
+            end
+        end
+    end
+    local ret = pg:FindFirstChild("AimReticleGui")
+    if ret and ret:IsA("ScreenGui") and ret.Enabled then
+        local sc = ret:FindFirstChild("Scope", true)
+        if sc and sc:IsA("GuiObject") and sc.Visible and sc.AbsoluteSize.X > 200 and isShown(sc)
+           and resolveScopeButton() == nil then
+            return true
+        end
+    end
+    return false
+end
+
+-- Switch dart like the game does: Remotes.Equip:FireServer("Dart", name)
+local function equipDart(name)
+    if equippedDart == name then return end
+    local eq = getRemote("Equip")
+    if not eq then return end
+    pcall(function() eq:FireServer("Dart", name) end)
+    equippedDart = name
+    task.wait(0.15)
+end
+
+local function waitAimUi(seconds)
+    local t0 = tick()
+    while tick() - t0 < seconds do
+        if isScoped() then return true end
+        task.wait(0.1)
+        if not RUNNING then return false end
+    end
+    return false
+end
+
+-- Auto-scope: click the Scope button. Each method is verified by the scope view opening,
+-- so we never click twice and toggle the scope back off.
 local function autoScope()
-    if findShootButton() then return true end
-    local b = resolveScopeButton() or findButton({"scope"}, true)
+    if isScoped() then return true end
+    local b = resolveScopeButton() or findButton({"scope"}, true, true)
     if b then
         print("[PetESP v8.3] scope button: " .. b:GetFullName())
         tapButton(b, "real")
-        if waitAimUi(1.0) then return true end
+        if waitAimUi(1.2) then return true end
         tapButton(b, "signal")
-        if waitAimUi(1.0) then return true end
+        if waitAimUi(1.2) then return true end
     else
-        print("[PetESP v8.3] scope button not found - press LEARN SCOPE and click it once")
+        print("[PetESP v8.3] scope button not found (already scoped, or the GUI changed)")
     end
     enterAimMode(true)
     local ok = waitAimUi(1.5)
-    if not ok then print("[PetESP v8.3] scope did not open, or the SHOOT button was not detected") end
+    if not ok then print("[PetESP v8.3] scope view did not open") end
     return ok
 end
 
@@ -1734,6 +1819,7 @@ end)
 task.spawn(function()
     local scopedFor = nil
     local scopeTriedAt = 0
+    local lastValueScan = 0
     local shots = setmetatable({}, {__mode = "k"})
     local lastSleepShot = 0
     while RUNNING do
@@ -1755,11 +1841,31 @@ task.spawn(function()
 
             -- 2) open the scope (once per target, or again if the aim screen closed)
             if CONFIG.AUTO_SCOPE and (scopedFor ~= target
-               or (tick() - scopeTriedAt > 6 and not findShootButton())) then
+               or (tick() - scopeTriedAt > 6 and not isScoped())) then
                 scopeTriedAt = tick()
                 autoScope()
                 scopedFor = target
                 if not RUNNING or collecting or lockTarget ~= target then return end
+            end
+
+            if CONFIG.REQUIRE_SCOPE and not isScoped() then return end    -- never waste darts outside the scope view
+
+            -- learn this species' value from the info label the game shows while we are focused on it
+            if valueFromCache and not valueFromCache(target) and tick() - lastValueScan > 1.5 then
+                lastValueScan = tick()
+                for _, d in ipairs(PlayerGui:GetDescendants()) do
+                    if d:IsA("TextLabel") and d.Visible and d.Text ~= "" then
+                        local v = parseFocusLabel(d.Text)
+                        if v then
+                            local sp = getAttr(target, "Species") or getPetName(target)
+                            local mut = getMutation(target)
+                            speciesValue[tostring(sp) .. (mut and ("|" .. mut) or "")] = v
+                            saveLearned()
+                            print("[PetESP v8.3] learned value " .. tostring(sp) .. " = " .. formatValue(v) .. " $/s")
+                            break
+                        end
+                    end
+                end
             end
 
             -- 3) pick the dart: fill circles first, sleep dart last
@@ -1774,7 +1880,10 @@ task.spawn(function()
             end
 
             local fired = false
-            if CONFIG.USE_REMOTE_FIRE then fired = remoteFireAt(center, dart) end
+            if CONFIG.USE_REMOTE_FIRE then
+                equipDart(dart)
+                fired = remoteFireAt(center, dart)
+            end
             if fired then
                 shots[target] = n + 1
                 lastShotTarget = target
@@ -1815,6 +1924,47 @@ debugDump = function()
         if okA then for k, v in pairs(attrs) do print("  attr " .. k .. " = " .. tostring(v)) end end
     end
     pcall(resolveDarts)
+    print("scoped=" .. tostring(isScoped()) .. " equipped=" .. tostring(equippedDart)
+        .. " scopeBtnShown=" .. tostring(resolveScopeButton() ~= nil))
+    local rows = {}
+    for _, p in ipairs(cachedPets) do
+        local c = p.Parent and getPetCenter(p)
+        if c then rows[#rows + 1] = { p = p, d = (c - me).Magnitude } end
+    end
+    table.sort(rows, function(a, b) return a.d < b.d end)
+    for i = 1, math.min(8, #rows) do
+        local p = rows[i].p
+        print("  #" .. i .. " " .. p.Name .. " d=" .. math.floor(rows[i].d) .. " downed=" .. tostring(isDowned(p))
+            .. " ring=" .. tostring(ringTimer(p)) .. " mut=" .. tostring(getMutation(p))
+            .. " species=" .. tostring(getAttr(p, "Species")) .. " cachedValue=" .. tostring(valueFromCache(p)))
+    end
+    print("  -- GUI labels showing $/s or a decimal ring --")
+    local shown = 0
+    for _, d in ipairs(PlayerGui:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Text ~= "" and (parseIncome(d.Text) or d.Text:match("^%s*%d+%.%d+%s*s?%s*$")) then
+            local bg = d:FindFirstAncestorWhichIsA("BillboardGui")
+            print("  " .. d:GetFullName() .. " = " .. d.Text
+                .. (bg and (" | adornee=" .. (bg.Adornee and bg.Adornee:GetFullName() or "nil")) or ""))
+            shown = shown + 1
+            if shown >= 6 then break end
+        end
+    end
+    for _, gname in ipairs({"AimGui", "AimReticleGui"}) do
+        local g = PlayerGui:FindFirstChild(gname)
+        if g then
+            print("  " .. gname .. " enabled=" .. tostring(g.Enabled))
+            local n = 0
+            for _, d in ipairs(g:GetDescendants()) do
+                if d:IsA("GuiObject") then
+                    n = n + 1
+                    if n <= 25 then
+                        print("    " .. d:GetFullName():gsub(".*PlayerGui%.", "") .. " [" .. d.ClassName .. "] vis="
+                            .. tostring(d.Visible) .. (d:IsA("TextButton") and (" txt=" .. d.Text) or ""))
+                    end
+                end
+            end
+        end
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -1990,7 +2140,9 @@ task.spawn(function()
                                 newText = tag .. getPetName(pet) .. "  FREE!" .. (left and (" " .. fmtTime(left)) or "")
                             else
                                 local ni = nativeInfo(pet)
-                                local vtxt = ni and (formatValue(ni.value) .. " $/s") or ("$" .. formatValue(getPetValue(pet)))
+                                local cv = valueFromCache and valueFromCache(pet)
+                                local vtxt = ni and (formatValue(ni.value) .. " $/s")
+                                    or (cv and (formatValue(cv) .. " $/s")) or ("$" .. formatValue(getPetValue(pet)))
                                 newText = tag .. getPetName(pet) .. "  " .. vtxt .. "  " .. math.floor(dist) .. "m"
                             end
                             if newText ~= esp.lastText then
