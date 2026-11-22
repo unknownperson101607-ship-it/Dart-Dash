@@ -11,6 +11,9 @@
 --   * X button = full shutdown (every loop stops, ESP/highlights/GUI destroyed).
 --     "-" button = hide the panel; tap the small PET bubble to bring it back.
 --   * Buttons use .Activated so they work on touch.
+-- v8.3.8:
+--   * Panel scales itself to fit the screen (UIScale; ~0.72 on phones, never taller than the viewport).
+--     CONFIG.GUI_SCALE = "auto" or a number (0.5 = half size).
 -- v8.3.7:
 --   * Scope: every visible candidate button (known path, then any button named/labelled "scope", max 3) is
 --     clicked in turn and the scope view is checked after each click.
@@ -124,6 +127,7 @@ local CONFIG = {
     FILL_SHOTS      = 5,             -- fill-dart shots before the sleep dart when the circles can't be read
     SLEEP_RETRY     = 2.0,           -- seconds between sleep-dart shots (saves your Abyss darts)
     AUTO_SCOPE      = true,
+    GUI_SCALE       = "auto",                         -- "auto" = fit the screen, or a number like 0.6
     REQUIRE_SCOPE   = true,          -- only shoot while the scope view is open (saves your darts)
     AUTO_BASE_ON_CARRY = true,       -- picked up a downed animal (by you or the script) -> go to BASE_POS
     CARRY_MAX_SECS  = 60,            -- aiming stays paused at most this long per carry
@@ -1091,6 +1095,28 @@ MainFrame.Active = true
 MainFrame.Draggable = true
 MainFrame.Parent = ScreenGui
 Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 12)
+
+-- Fit the panel to the screen (phones): scale the whole panel instead of resizing every element
+local GuiScale = Instance.new("UIScale")
+GuiScale.Parent = MainFrame
+local function fitScale()
+    local cam = Workspace.CurrentCamera
+    local vh = cam and cam.ViewportSize.Y or 400
+    local sc
+    if type(CONFIG.GUI_SCALE) == "number" then
+        sc = CONFIG.GUI_SCALE
+    else
+        sc = math.min((vh - 20) / 444, IS_MOBILE and 0.72 or 1)
+    end
+    GuiScale.Scale = math.clamp(sc, 0.4, 1.2)
+end
+fitScale()
+do
+    local cam = Workspace.CurrentCamera
+    if cam then
+        table.insert(connections, cam:GetPropertyChangedSignal("ViewportSize"):Connect(fitScale))
+    end
+end
 
 local Stroke = Instance.new("UIStroke")
 Stroke.Thickness = 1.8
