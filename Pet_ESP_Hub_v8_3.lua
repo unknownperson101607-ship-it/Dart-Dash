@@ -11,6 +11,11 @@
 --   * X button = full shutdown (every loop stops, ESP/highlights/GUI destroyed).
 --     "-" button = hide the panel; tap the small PET bubble to bring it back.
 --   * Buttons use .Activated so they work on touch.
+-- v8.3.7:
+--   * Scope: every visible candidate button (known path, then any button named/labelled "scope", max 3) is
+--     clicked in turn and the scope view is checked after each click.
+--   * DEBUG also shows the sleeping animal: decimal ring labels anywhere in Workspace (with billboard, model,
+--     distance, attributes), billboards on the 3 nearest animals, and animals we sleep-darted.
 -- v8.3.6 (from your SPY/DEBUG logs):
 --   * Scope button = PlayerGui.AimGui.Root.ScopeButton. "Scoped" is now detected from the scope view itself
 --     (reticle / BACK button), NOT from the SHOOT button (it is visible but greyed out when not scoped).
@@ -1779,20 +1784,57 @@ local function waitAimUi(seconds)
     return false
 end
 
+-- Every visible button that could be the Scope button: the known path first, then any button
+-- named / labelled "scope" (HUD button included). Obvious shop/upgrade buttons are skipped.
+local function scopeCandidates()
+    local out, seen = {}, {}
+    local function add(b)
+        if b and not seen[b] then
+            seen[b] = true
+            table.insert(out, b)
+        end
+    end
+    add(resolveScopeButton())
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    if pg then
+        for _, d in ipairs(pg:GetDescendants()) do
+            if d:IsA("GuiButton") and d.Visible and d.AbsoluteSize.X > 5 and isShown(d)
+               and not (ScreenGui and d:IsDescendantOf(ScreenGui)) then
+                local lbl = buttonLabel(d)
+                local hit = lbl:find("scope", 1, true) ~= nil
+                if not hit then
+                    for _, k in ipairs(d:GetDescendants()) do
+                        if k:IsA("TextLabel") and k.Text ~= "" and k.Text:lower():find("scope", 1, true) then
+                            hit = true
+                            break
+                        end
+                    end
+                end
+                if hit and not (lbl:find("upgrade", 1, true) or lbl:find("buy", 1, true)
+                                or lbl:find("shop", 1, true) or lbl:find("skin", 1, true)) then
+                    add(d)
+                end
+            end
+        end
+    end
+    return out
+end
+
 -- Auto-scope: click the Scope button. Each method is verified by the scope view opening,
 -- so we never click twice and toggle the scope back off.
 local function autoScope()
     if isScoped() then return true end
-    local b = resolveScopeButton() or findButton({"scope"}, true, true)
-    if b then
-        print("[PetESP v8.3] scope button: " .. b:GetFullName())
+    local tried = 0
+    for _, b in ipairs(scopeCandidates()) do
+        tried = tried + 1
+        if tried > 3 or not RUNNING then break end
+        print("[PetESP v8.3] scope click " .. tried .. ": " .. b:GetFullName())
         tapButton(b, "real")
         if waitAimUi(1.2) then return true end
         tapButton(b, "signal")
         if waitAimUi(1.2) then return true end
-    else
-        print("[PetESP v8.3] scope button not found (already scoped, or the GUI changed)")
     end
+    if tried == 0 then print("[PetESP v8.3] no scope button visible (already scoped, or the GUI changed)") end
     enterAimMode(true)
     local ok = waitAimUi(1.5)
     if not ok then print("[PetESP v8.3] scope view did not open") end
@@ -1937,6 +1979,57 @@ debugDump = function()
         print("  #" .. i .. " " .. p.Name .. " d=" .. math.floor(rows[i].d) .. " downed=" .. tostring(isDowned(p))
             .. " ring=" .. tostring(ringTimer(p)) .. " mut=" .. tostring(getMutation(p))
             .. " species=" .. tostring(getAttr(p, "Species")) .. " cachedValue=" .. tostring(valueFromCache(p)))
+    end
+    print("  -- scope button candidates --")
+    for _, b in ipairs(scopeCandidates()) do print("  scope candidate: " .. b:GetFullName()) end
+
+    print("  -- sleeping animal / ring location (stand next to it) --")
+    local me2 = getPlayerPos()
+    local function attrsOf(inst)
+        local okA, at = pcall(function() return inst:GetAttributes() end)
+        if okA then
+            local c = 0
+            for k, v in pairs(at) do
+                print("      attr " .. k .. " = " .. tostring(v))
+                c = c + 1
+                if c >= 8 then break end
+            end
+        end
+    end
+    local ringsFound = 0
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Text:match("^%s*%d+%.%d+%s*s?%s*$") then
+            local g = d:FindFirstAncestorWhichIsA("BillboardGui")
+            local host = g and (g.Adornee or g.Parent) or d.Parent
+            local m = host and ((host:IsA("Model") and host) or host:FindFirstAncestorWhichIsA("Model"))
+            local pos = m and getPetCenter(m)
+            print("  ring label: " .. d:GetFullName() .. " = " .. d.Text .. " | billboard="
+                .. (g and g:GetFullName() or "none") .. " | model=" .. (m and m:GetFullName() or "none")
+                .. (pos and (" dist=" .. math.floor((pos - me2).Magnitude)) or ""))
+            if m then attrsOf(m) end
+            ringsFound = ringsFound + 1
+            if ringsFound >= 5 then break end
+        end
+    end
+    if ringsFound == 0 then print("  no decimal ring label in Workspace (stand closer to the sleeping animal and retry)") end
+    for i = 1, math.min(3, #rows) do
+        local p = rows[i].p
+        for _, g in ipairs(p:GetDescendants()) do
+            if g:IsA("BillboardGui") then
+                local texts = {}
+                for _, t in ipairs(g:GetDescendants()) do
+                    if t:IsA("TextLabel") and t.Text ~= "" then table.insert(texts, t.Text) end
+                end
+                print("  #" .. i .. " " .. p.Name .. " billboard " .. g.Name .. " [" .. table.concat(texts, " | ") .. "]")
+            end
+        end
+    end
+    for m, t in pairs(sleepShotAt) do
+        if m.Parent then
+            local an = anchorT[m]
+            print("  slept-darted: " .. m:GetFullName() .. " shot " .. math.floor(tick() - t) .. "s ago, still for "
+                .. (an and math.floor(tick() - an) or -1) .. "s, ring=" .. tostring(ringTimer(m)))
+        end
     end
     print("  -- GUI labels showing $/s or a decimal ring --")
     local shown = 0
