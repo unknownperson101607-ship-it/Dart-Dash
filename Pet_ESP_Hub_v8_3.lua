@@ -11,6 +11,10 @@
 --   * X button = full shutdown (every loop stops, ESP/highlights/GUI destroyed).
 --     "-" button = hide the panel; tap the small PET bubble to bring it back.
 --   * Buttons use .Activated so they work on touch.
+-- v8.3.4:
+--   * DOWNED = the green ring with the decimal seconds countdown (e.g. 111.6) above a sleeping animal.
+--     Awake wild animals (despawn timer "1:52", free-to-catch banner name match) are NOT downed any more:
+--     no FREE! tag, no pick-up, and they stay valid aim targets.
 -- v8.3.3:
 --   * Mutations (Gold / Diamond / Rainbow / Void): coloured + tagged in ESP, always shown, aimed at first.
 --   * Carry-back: reads the sleep countdown (free-to-catch banner / timer on the animal / dart estimate),
@@ -101,6 +105,8 @@ local CONFIG = {
     FILL_SHOTS      = 5,             -- fill-dart shots before the sleep dart when the circles can't be read
     SLEEP_RETRY     = 2.0,           -- seconds between sleep-dart shots (saves your Abyss darts)
     AUTO_SCOPE      = true,
+    DOWNED_BY_BANNER = false,        -- old behaviour: banner name match marks every animal of that species as downed
+    DOWNED_BY_PROMPT = false,        -- old behaviour: a catch/collect prompt marks an animal as downed
 
     -- v8.3.3
     AIM_MUTATIONS_FIRST = true,      -- Void > Rainbow > Diamond > Gold are targeted before normal animals
@@ -530,6 +536,38 @@ local function updateFreeToCatch()
     end
 end
 
+-- The sleeping animal shows a green ring with a decimal countdown: "111.6" (seconds left asleep).
+-- Awake animals only have a despawn timer like "1:52", which is NOT this.
+local ringCache = setmetatable({}, {__mode = "k"})
+local function ringTimer(model)
+    local c = ringCache[model]
+    if c and tick() - c.t < 0.25 then return c.v end
+    local v = nil
+    local function scan(root)
+        for _, d in ipairs(root:GetDescendants()) do
+            if d:IsA("TextLabel") then
+                local num = d.Text:match("^%s*(%d+%.%d+)%s*s?%s*$")
+                if num then
+                    v = tonumber(num)
+                    return true
+                end
+            end
+        end
+        return false
+    end
+    for _, g in ipairs(model:GetDescendants()) do
+        if g:IsA("BillboardGui") and g.Name ~= "PetESP" and scan(g) then break end
+    end
+    if not v then
+        for _, g in ipairs(PlayerGui:GetChildren()) do
+            if g:IsA("BillboardGui") and g.Name ~= "PetESP" and g.Adornee
+               and g.Adornee:IsDescendantOf(model) and scan(g) then break end
+        end
+    end
+    ringCache[model] = { t = tick(), v = v }
+    return v
+end
+
 local function matchesFTC(model)
     if not (freeToCatchName and freeToCatchName ~= "") then return false end
     local pn = normAlnum(getPetName(model))
@@ -544,7 +582,7 @@ local function isDowned(model)
 
     -- Free to catch banner name match (guarded against empty pet name)
     if freeToCatchName and freeToCatchName ~= "" then
-        if matchesFTC(model) then return true end
+        if CONFIG.DOWNED_BY_BANNER and matchesFTC(model) then return true end
     end
 
     local state = getAttr(model, "State")
@@ -569,17 +607,10 @@ local function isDowned(model)
     end
 
     -- Downed prompts (catch ProximityPrompt only)
-    if hasCatchProximity(model) then return true end
+    if CONFIG.DOWNED_BY_PROMPT and hasCatchProximity(model) then return true end
 
-    -- Timer / catch text label directly on the pet
-    for _, d in ipairs(model:GetDescendants()) do
-        if d:IsA("TextLabel") and d.Text then
-            local t = d.Text:lower()
-            if t:find("to catch", 1, true) or t:find("free to catch", 1, true) or t:match("%d+:%d%d") then
-                return true
-            end
-        end
-    end
+    -- The ring countdown above a sleeping animal is the signal
+    if ringTimer(model) then return true end
 
     return false
 end
@@ -595,13 +626,8 @@ end
 -- Seconds until a downed animal wakes (nil = unknown). Best source first:
 -- 1) a timer label on the animal, 2) the free-to-catch banner countdown, 3) our own estimate.
 local function sleepLeft(pet)
-    for _, d in ipairs(pet:GetDescendants()) do
-        if d:IsA("TextLabel") then
-            local mm, ss = d.Text:match("^%s*(%d+):(%d%d)%s*$")
-            if mm then return tonumber(mm) * 60 + tonumber(ss) end
-        end
-    end
-    if freeToCatchSecs and matchesFTC(pet) then return freeToCatchSecs end
+    local ring = ringTimer(pet)
+    if ring then return ring end
     local base = sleepShotAt[pet] or downedAt[pet]
     if base then return dartSleepSeconds(CONFIG.SLEEP_DART) - (tick() - base) end
     return nil
@@ -650,16 +676,17 @@ end
 --------------------------------------------------------------------------------
 -- Label-based discovery: any BillboardGui that shows "$/S" (and the "1 in N" odds line) belongs to a wild animal
 local function labelState(b)
-    local inc, odds, hasText = false, false, false
+    local inc, odds, hasText, timer = false, false, false, false
     for _, d in ipairs(b:GetDescendants()) do
         if d:IsA("TextLabel") and d.Text ~= "" then
             hasText = true
             local t = d.Text:lower()
             if t:find("%$%s*/%s*s") then inc = true end
             if t:find("%d%s+in%s+%d") then odds = true end
+            if t:match("^%s*%d+%.%d+%s*s?%s*$") then timer = true end
         end
     end
-    return inc, odds, hasText
+    return inc, odds, hasText, timer
 end
 
 local function registerBillboard(b)
@@ -668,8 +695,8 @@ local function registerBillboard(b)
         for _, w in ipairs({0.4, 1.5, 4}) do
             task.wait(w)
             if not RUNNING or not b.Parent then return end
-            local inc, odds, hasText = labelState(b)
-            if inc and (odds or not CONFIG.LABEL_NEEDS_ODDS) then
+            local inc, odds, hasText, timer = labelState(b)
+            if (inc and (odds or not CONFIG.LABEL_NEEDS_ODDS)) or timer then
                 local host = b.Adornee or b.Parent
                 local model = host and ((host:IsA("Model") and host) or host:FindFirstAncestorWhichIsA("Model"))
                 if model and model ~= Workspace and not Players:GetPlayerFromCharacter(model)
