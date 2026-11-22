@@ -11,6 +11,14 @@
 --   * X button = full shutdown (every loop stops, ESP/highlights/GUI destroyed).
 --     "-" button = hide the panel; tap the small PET bubble to bring it back.
 --   * Buttons use .Activated so they work on touch.
+-- v8.3.1:
+--   * Aim sequence: TP to AIM_POS -> tap Scope -> fill circles with FILL_DART (Magma) ->
+--     finish with SLEEP_DART (Abyss) -> collect the downed animal -> TP to BASE_POS.
+--   * Collect fixes: name match ignores spaces (SeaTurtleRainbow vs "Sea Turtle Rainbow ..."),
+--     owned/base pets are never "downed" targets, no endless retry on the same pet.
+--   * FreeToCatch console spam fixed (prints only when it changes).
+--   * PET bubble reopens the panel (own tap/drag handling); RightShift also toggles it.
+--   * DEBUG button dumps world, buttons, darts and the nearest animal's attributes.
 -- ZONES: scans ANY folder named "Zones" in Workspace (World1, World2, Hub, Worlds...)
 --   Wild pet path: Workspace.<World>.Zones.<Zone>.Spawns.Spawn_<Name>_<n>
 -- FIX LIST vs v8:
@@ -29,7 +37,7 @@
 --   Aim : ReplicatedStorage.Remotes.EnterAim:FireServer()
 --   Fire: ReplicatedStorage.Remotes.Fire:FireServer(WEAPON, DART, directionUnit)
 --   Buy : ReplicatedStorage.Remotes.Buy:InvokeServer("DartsAll", "All")
---   >>> Edit CONFIG.WEAPON_NAME / CONFIG.DART_NAME below to the weapon + dart you use.
+--   >>> Edit CONFIG.WEAPON_NAME / SLEEP_DART / FILL_DART below to the weapon + darts you use.
 
 print("[PetESP v8.3] ====== LOADED OK - MOBILE + ANY ZONES + CLEAN ESP ======")
 
@@ -52,10 +60,10 @@ local IS_MOBILE = UserInput.TouchEnabled and not UserInput.MouseEnabled
 print("[PetESP v8.3] IS_MOBILE = " .. tostring(IS_MOBILE))
 
 local CONFIG = {
-    AIM_POS = Vector3.new(5973, 3, 2),
-    BASE_POS = Vector3.new(5977, 3, 99),
+    AIM_POS = Vector3.new(-5996, 3, 2),     -- stand here, open the scope, shoot
+    BASE_POS = Vector3.new(-6021, 3, 100),   -- go here after a catch
     BASE_RADIUS = 90,
-    BASE_BOX = {X_MIN = 5900, X_MAX = 6050, Z_MIN = 20, Z_MAX = 180},
+    BASE_BOX = {X_MIN = -6110, X_MAX = -5930, Z_MIN = 20, Z_MAX = 180},
 
     ESP_ENABLED   = true,
     AUTO_AIM      = true,
@@ -73,13 +81,16 @@ local CONFIG = {
     COLLECT_COOLDOWN = 1.0,
 
     -- v8.3 flags
-    FORCE_AIM_SPOT = false,          -- true = old fixed-scope behaviour (teleport to AIM_POS before shooting)
+    FORCE_AIM_SPOT = true,           -- true = old fixed-scope behaviour (teleport to AIM_POS before shooting)
     TP_BASE_AFTER_COLLECT = true,    -- after catching a wild downed pet, teleport to BASE_POS
 
     -- v8.3 remotes + aim lock
     USE_REMOTE_FIRE = true,          -- Remotes.EnterAim + Remotes.Fire (the real way this game shoots)
     WEAPON_NAME     = "RlyehTrident",-- <<< change to the weapon you use
-    DART_NAME       = "Abysse",      -- <<< change to the dart you use
+    SLEEP_DART      = "Abysse",      -- dart that puts the animal to sleep (Abyss Harpoon, sleeps 125s)
+    FILL_DART       = "auto",        -- cheap dart that fills the hit circles (Magma Harpoon). "auto" = look it up, else "Magma"
+    FILL_SHOTS      = 5,             -- fill-dart shots before the sleep dart when the circles can't be read
+    SLEEP_RETRY     = 2.0,           -- seconds between sleep-dart shots (saves your Abyss darts)
     FIRE_ORIGIN     = "camera",      -- "camera" or "character" - origin used to build the aim vector
     FIRE_INTERVAL   = 0.35,          -- seconds between Fire remote calls while locked on
     AIM_LOCK        = true,          -- glue the camera to the target every frame
@@ -92,7 +103,7 @@ local CONFIG = {
     -- v8.3
     WORLD             = "auto",      -- "auto" = world you are in; or pin a name like "World3"
     SCAN_EXTRA_FOLDERS = false,      -- also scan Workspace.Pets/ClientPets/... (not world-specific)
-    AIM_MAX_DIST      = 300,         -- only lock onto animals within this many studs
+    AIM_MAX_DIST      = 400,         -- only lock onto animals within this many studs
     AIM_PRIORITY      = "Nearest",   -- "Nearest" or "Value"
 }
 
@@ -133,6 +144,11 @@ local aimLockRef   = nil   -- last target we called EnterAim for
 local aimEnteredAt = 0
 local AIM_BIND     = "PetESPAimLock"
 local currentWorldName = "?"
+local lastFTCPrinted = nil
+local collecting     = false                       -- true while the collect + go-to-base routine runs
+local collectTried   = setmetatable({}, {__mode = "k"})
+local lastShotTarget = nil
+local debugDump      = nil                         -- assigned later
 
 --------------------------------------------------------------------------------
 -- Real game remotes (confirmed):
@@ -182,13 +198,13 @@ local function getFireOrigin()
     return hrp and hrp.Position or Vector3.new(0, 0, 0)
 end
 
-local function remoteFireAt(center)
+local function remoteFireAt(center, dart)
     local fire = getRemote("Fire")
     if not fire or not center then return false end
     local d = center - getFireOrigin()
     if d.Magnitude < 0.01 then return false end
     return (pcall(function()
-        fire:FireServer(CONFIG.WEAPON_NAME, CONFIG.DART_NAME, d.Unit)
+        fire:FireServer(CONFIG.WEAPON_NAME, dart or CONFIG.SLEEP_DART, d.Unit)
     end))
 end
 
@@ -314,6 +330,10 @@ end
 
 -- Stricter than the ESP scan: only things that really look like wild animals are
 -- eligible for aim lock (so we never lock onto scenery models).
+local function normAlnum(str)
+    return (tostring(str):lower():gsub("[^%w]", ""))
+end
+
 local function isWildAnimal(model)
     if model.Name:find("Spawn_", 1, true) then return true end
     if model.Parent and model.Parent.Name == "Spawns" then return true end
@@ -362,7 +382,8 @@ local function updateFreeToCatch()
                         end
                     end
                 end
-                if freeToCatchName then
+                if freeToCatchName and freeToCatchName ~= lastFTCPrinted then
+                    lastFTCPrinted = freeToCatchName          -- print only when it changes
                     print("[PetESP v8.3] FreeToCatch = " .. freeToCatchName)
                 end
                 break
@@ -377,12 +398,11 @@ local function isDowned(model)
 
     -- Free to catch banner name match (guarded against empty pet name)
     if freeToCatchName and freeToCatchName ~= "" then
-        local pn = getPetName(model):lower()
+        -- compare with spaces/punctuation stripped: "SeaTurtleRainbow" vs "Sea Turtle Rainbow COMMON · Coral Reef"
+        local pn = normAlnum(getPetName(model))
         if #pn >= 3 then
-            local ftc = freeToCatchName:lower()
-            if ftc:find(pn, 1, true) or pn:find(ftc, 1, true)
-               or (pn:find("mosasaurus", 1, true) and ftc:find("mosasaurus", 1, true))
-               or (pn:find("baryonyx", 1, true) and ftc:find("baryonyx", 1, true)) then
+            local ftc = normAlnum(freeToCatchName)
+            if ftc:find(pn, 1, true) or pn:find(ftc, 1, true) then
                 return true
             end
         end
@@ -890,7 +910,7 @@ local WeaponLabel = Instance.new("TextLabel")
 WeaponLabel.Size = UDim2.new(1, -20, 0, 16)
 WeaponLabel.Position = UDim2.new(0, 10, 0, 392)
 WeaponLabel.BackgroundTransparency = 1
-WeaponLabel.Text = "WEAPON: " .. CONFIG.WEAPON_NAME
+WeaponLabel.Text = "WEAPON: " .. CONFIG.WEAPON_NAME .. " | SLEEP: " .. CONFIG.SLEEP_DART
 WeaponLabel.TextColor3 = Color3.fromRGB(160, 200, 255)
 WeaponLabel.TextSize = 9
 WeaponLabel.Font = Enum.Font.Code
@@ -902,6 +922,7 @@ TestBtn.Activated:Connect(function()
     cachedPets = scanZonesFast()
     lastScan = tick()
     print("[PetESP v8.3] SCAN=" .. #cachedPets .. " | FTC=" .. tostring(freeToCatchName))
+    if debugDump then pcall(debugDump) end
 end)
 
 local CloseBtn = Instance.new("TextButton")
@@ -937,21 +958,51 @@ OpenBtn.Text = "PET"
 OpenBtn.TextSize = 13
 OpenBtn.Font = Enum.Font.GothamBold
 OpenBtn.Active = true
-OpenBtn.Draggable = true
 OpenBtn.Visible = false
 OpenBtn.Parent = ScreenGui
 Instance.new("UICorner", OpenBtn).CornerRadius = UDim.new(1, 0)
 
-MiniBtn.Activated:Connect(function()
-    OpenBtn.Position = MainFrame.Position
-    MainFrame.Visible = false
-    OpenBtn.Visible = true
-end)
-OpenBtn.Activated:Connect(function()
-    MainFrame.Position = OpenBtn.Position
-    OpenBtn.Visible = false
-    MainFrame.Visible = true
-end)
+local function showPanel(show)
+    if show then MainFrame.Position = OpenBtn.Position else OpenBtn.Position = MainFrame.Position end
+    MainFrame.Visible = show
+    OpenBtn.Visible = not show
+end
+MiniBtn.Activated:Connect(function() showPanel(false) end)
+
+-- PET bubble: own drag + tap handling (a Draggable button can swallow the tap and never reopen)
+do
+    local dragging, moved, startInput, startPos = false, false, nil, nil
+    local function isPointer(i)
+        return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch
+    end
+    table.insert(connections, OpenBtn.InputBegan:Connect(function(input)
+        if isPointer(input) then
+            dragging, moved = true, false
+            startInput, startPos = input.Position, OpenBtn.Position
+        end
+    end))
+    table.insert(connections, UserInput.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - startInput
+            if delta.Magnitude > 6 then moved = true end
+            if moved then
+                OpenBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
+                                             startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            end
+        end
+    end))
+    table.insert(connections, UserInput.InputEnded:Connect(function(input)
+        if dragging and isPointer(input) then
+            dragging = false
+            if not moved then showPanel(true) end
+        end
+    end))
+end
+-- RightShift also toggles the panel (PC)
+table.insert(connections, UserInput.InputBegan:Connect(function(input, gp)
+    if not gp and input.KeyCode == Enum.KeyCode.RightShift then showPanel(not MainFrame.Visible) end
+end))
 
 --------------------------------------------------------------------------------
 -- Character + input helpers
@@ -971,6 +1022,16 @@ local function teleportTo(pos)
     end
 end
 
+local function isShown(g)
+    local p = g
+    while p and p ~= game do
+        if p:IsA("GuiObject") and not p.Visible then return false end
+        if p:IsA("ScreenGui") then return p.Enabled end
+        p = p.Parent
+    end
+    return true
+end
+
 -- Find a button by keywords across PlayerGui + CoreGui, skipping our own hub GUI
 local function findButton(keywords, excludeOwn)
     local roots = {}
@@ -982,7 +1043,7 @@ local function findButton(keywords, excludeOwn)
     end)
     for _, root in ipairs(roots) do
         for _, d in ipairs(root:GetDescendants()) do
-            if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible and d.AbsoluteSize.X > 5 then
+            if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible and d.AbsoluteSize.X > 5 and isShown(d) then
                 local skip = excludeOwn and ScreenGui and d:IsDescendantOf(ScreenGui)
                 if not skip then
                     local s = (tostring(d.Name or "") .. " " .. tostring(d.Text or "")):lower()
@@ -1020,7 +1081,7 @@ end
 
 local function findShootButton()
     -- NOTE: "scope" removed on purpose (tapping scope would not shoot)
-    return findButton({"shoot", "fire", "dart", "attack"}, true)
+    return findButton({"shoot"}, true)
 end
 
 local function findCatchButton()
@@ -1102,13 +1163,85 @@ local function clickCenter()
     end)
 end
 
--- Auto-scope: EnterAim remote (+ wheel zoom on PC) and, on mobile, tap a Scope/Zoom button
-local function autoScope()
-    enterAimMode(true)
-    if IS_MOBILE then
-        local b = findButton({"scope", "zoom"}, true)
-        if b then tapButton(b) end
+-- Which dart names does the game use? Best-effort lookup (printed so you can verify).
+local fillDart = "Magma"
+local function resolveDarts()
+    local function names(keyword)
+        local out, seen = {}, {}
+        for _, d in ipairs(RepStorage:GetDescendants()) do
+            if not d:FindFirstAncestor("Remotes") and d.Name:lower():find(keyword, 1, true) and not seen[d.Name] then
+                seen[d.Name] = true
+                table.insert(out, d.Name)
+            end
+        end
+        return out
     end
+    local magma, abyss = names("magma"), names("abyss")
+    print("[PetESP v8.3] magma candidates: " .. (#magma > 0 and table.concat(magma, ", ") or "none")
+        .. " | abyss candidates: " .. (#abyss > 0 and table.concat(abyss, ", ") or "none"))
+    if tostring(CONFIG.FILL_DART):lower() ~= "auto" then
+        fillDart = CONFIG.FILL_DART
+    elseif #magma > 0 then
+        fillDart = magma[1]
+    end
+    print("[PetESP v8.3] fill dart = " .. tostring(fillDart) .. " | sleep dart = " .. tostring(CONFIG.SLEEP_DART))
+end
+task.spawn(function() pcall(resolveDarts) end)
+
+-- Dots above an animal's head (best effort): how many hit circles it has
+local function countHitDots(pet)
+    local best = nil
+    for _, g in ipairs(pet:GetDescendants()) do
+        if g:IsA("BillboardGui") then
+            for _, c in ipairs(g:GetDescendants()) do
+                local n, sz = 0, nil
+                for _, k in ipairs(c:GetChildren()) do
+                    if (k:IsA("Frame") or k:IsA("ImageLabel")) and k.Visible then
+                        local a = k.AbsoluteSize
+                        if a.X > 2 and math.abs(a.X - a.Y) <= 2 then
+                            sz = sz or a.X
+                            if math.abs(a.X - sz) <= 2 then n = n + 1 end
+                        end
+                    end
+                end
+                if n >= 3 and n <= 15 and (not best or n > best) then best = n end
+            end
+        end
+    end
+    return best
+end
+
+-- fill shots needed = total circles - 1 (the last hit is the sleep dart)
+local function fillShotsFor(pet)
+    for _, k in ipairs({"MaxHits", "HitsNeeded", "DartsNeeded", "MaxDarts", "RequiredHits"}) do
+        local v = getAttr(pet, k)
+        if type(v) == "number" and v > 0 then return math.max(0, v - 1) end
+    end
+    local dots = countHitDots(pet)
+    if dots then return math.max(0, dots - 1) end
+    return CONFIG.FILL_SHOTS
+end
+
+local function waitAimUi(seconds)
+    local t0 = tick()
+    while tick() - t0 < seconds do
+        if findShootButton() then return true end
+        task.wait(0.1)
+        if not RUNNING then return false end
+    end
+    return false
+end
+
+-- Auto-scope: tap the Scope button (right side of the screen); fall back to the EnterAim remote
+local function autoScope()
+    if findShootButton() then return true end
+    local b = findButton({"scope"}, true)
+    if b then
+        tapButton(b)
+        if waitAimUi(1.2) then return true end
+    end
+    enterAimMode(true)
+    return waitAimUi(1.5)
 end
 
 RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 1, function()
@@ -1126,42 +1259,85 @@ RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 1, func
     end
 end)
 
+-- Sequence per animal: go to the aim spot -> open scope -> fill circles with the cheap dart
+-- -> finish with the sleep dart (Abyss) -> animal goes down -> main loop collects it.
 task.spawn(function()
     local scopedFor = nil
+    local shots = setmetatable({}, {__mode = "k"})
+    local lastSleepShot = 0
     while RUNNING do
         task.wait(CONFIG.FIRE_INTERVAL)
         local ok, err = pcall(function()
-            if not (RUNNING and CONFIG.AUTO_AIM) then scopedFor = nil return end
+            if not (RUNNING and CONFIG.AUTO_AIM) or collecting then scopedFor = nil return end
             local target = lockTarget
             if not (target and target.Parent) then scopedFor = nil return end
             local center = getPetCenter(target)
             if not center then return end
 
-            if scopedFor ~= target then          -- once per new target
-                scopedFor = target
-                autoScope()
-                if not RUNNING then return end
+            -- 1) stand on the aim spot
+            if CONFIG.FORCE_AIM_SPOT and (getPlayerPos() - CONFIG.AIM_POS).Magnitude > 15 then
+                teleportTo(CONFIG.AIM_POS)
+                task.wait(0.5)
+                scopedFor = nil
+                if not RUNNING or collecting then return end
             end
 
-            -- keep the crosshair on the animal (used by click/tap fallbacks)
-            local cam = Workspace.CurrentCamera
-            if cam then
-                local vp, onScreen = cam:WorldToViewportPoint(center)
-                if onScreen and vp.Z > 0 then
-                    pcall(function() VIM:SendMouseMoveEvent(vp.X, vp.Y, game) end)
-                end
+            -- 2) open the scope (once per target, or again if the aim screen closed)
+            if scopedFor ~= target or not findShootButton() then
+                autoScope()
+                scopedFor = target
+                if not RUNNING or collecting or lockTarget ~= target then return end
+            end
+
+            -- 3) pick the dart: fill circles first, sleep dart last
+            local n = shots[target] or 0
+            local dart
+            if n < fillShotsFor(target) then
+                dart = fillDart
+            else
+                if tick() - lastSleepShot < CONFIG.SLEEP_RETRY then return end
+                dart = CONFIG.SLEEP_DART
+                lastSleepShot = tick()
             end
 
             local fired = false
-            if CONFIG.USE_REMOTE_FIRE then fired = remoteFireAt(center) end
-            if not fired then
-                local btn = findShootButton()
-                if btn then tapButton(btn) else clickCenter() end
+            if CONFIG.USE_REMOTE_FIRE then fired = remoteFireAt(center, dart) end
+            if fired then
+                shots[target] = n + 1
+                lastShotTarget = target
+            else
+                local btn = findShootButton()      -- fallback: tap SHOOT (uses the equipped dart)
+                if btn then tapButton(btn); lastShotTarget = target else clickCenter() end
             end
         end)
         if not ok then print("[PetESP v8.3] aim/fire error: " .. tostring(err)) end
     end
 end)
+
+-- DEBUG button output: paste this in chat if something misbehaves
+debugDump = function()
+    local function nm(i) return i and i:GetFullName() or "none" end
+    print("[PetESP v8.3] ---- DEBUG ----")
+    print("world=" .. tostring(currentWorldName) .. " pets=" .. #cachedPets .. " FTC=" .. tostring(freeToCatchName))
+    print("sleepDart=" .. tostring(CONFIG.SLEEP_DART) .. " fillDart=" .. tostring(fillDart))
+    print("scopeButton=" .. nm(findButton({"scope"}, true)) .. " | shootButton=" .. nm(findShootButton()))
+    local me = getPlayerPos()
+    local nearest, nd = nil, math.huge
+    for _, p in ipairs(cachedPets) do
+        local c = p.Parent and getPetCenter(p)
+        if c then
+            local d = (c - me).Magnitude
+            if d < nd then nearest, nd = p, d end
+        end
+    end
+    if nearest then
+        print("nearest=" .. nearest:GetFullName() .. " dist=" .. math.floor(nd)
+            .. " downed=" .. tostring(isDowned(nearest)) .. " hitDots=" .. tostring(countHitDots(nearest)))
+        local okA, attrs = pcall(function() return nearest:GetAttributes() end)
+        if okA then for k, v in pairs(attrs) do print("  attr " .. k .. " = " .. tostring(v)) end end
+    end
+    pcall(resolveDarts)
+end
 
 --------------------------------------------------------------------------------
 -- Main loop
@@ -1187,8 +1363,8 @@ task.spawn(function()
                     local center = getPetCenter(pet)
                     if center and (center - playerPos).Magnitude < CONFIG.ESP_MAX_DIST then
                         local downed = isDowned(pet)
-                        if downed then table.insert(downedList, pet) end
                         if not isOwnedPet(pet) and not isInBase(center) then
+                            if downed then table.insert(downedList, pet) end
                             table.insert(espCandidates, pet)
                             if not downed and isWildAnimal(pet) then table.insert(aimCandidates, pet) end
                         end
@@ -1209,10 +1385,11 @@ task.spawn(function()
 
             -- Aim candidates always by value (highest first)
             -- Pick the lock target: in range, sticky (keep the current one while valid)
+            local aimOrigin = CONFIG.FORCE_AIM_SPOT and CONFIG.AIM_POS or playerPos
             local inRange = {}
             for _, pet in ipairs(aimCandidates) do
                 local c = getPetCenter(pet)
-                if c and (c - playerPos).Magnitude <= CONFIG.AIM_MAX_DIST then
+                if c and (c - aimOrigin).Magnitude <= CONFIG.AIM_MAX_DIST then
                     table.insert(inRange, pet)
                 end
             end
@@ -1226,12 +1403,12 @@ task.spawn(function()
                     table.sort(inRange, function(a, b)
                         local ca = getPetCenter(a) or Vector3.new()
                         local cb = getPetCenter(b) or Vector3.new()
-                        return (ca - playerPos).Magnitude < (cb - playerPos).Magnitude
+                        return (ca - aimOrigin).Magnitude < (cb - aimOrigin).Magnitude
                     end)
                 end
                 pick = inRange[1]
             end
-            lockTarget = CONFIG.AUTO_AIM and pick or nil
+            lockTarget = (CONFIG.AUTO_AIM and not collecting) and pick or nil
 
             local topN = CONFIG.LOW_LAG and 8 or CONFIG.TOP_N
             local keep = {}
@@ -1295,22 +1472,35 @@ task.spawn(function()
                     .. (freeToCatchName and (" | FTC: " .. freeToCatchName) or "")
             end
 
-            -- Priority: collect wild downed first (aim is now handled by the lock loop)
-            if CONFIG.AUTO_COLLECT and #downedList > 0 then
-                if tick() - lastCollect >= CONFIG.COLLECT_COOLDOWN then
+            -- Collect downed wild animals, then go to the base spot
+            if CONFIG.AUTO_COLLECT and #downedList > 0 and not collecting
+               and tick() - lastCollect >= CONFIG.COLLECT_COOLDOWN then
+                local fresh = {}
+                for _, pet in ipairs(downedList) do
+                    local t = collectTried[pet]
+                    if not t or tick() - t > 25 then table.insert(fresh, pet) end   -- no endless retry on one pet
+                end
+                if #fresh > 0 then
                     lastCollect = tick()
-                    table.sort(downedList, function(a, b)
+                    table.sort(fresh, function(a, b)
+                        if (a == lastShotTarget) ~= (b == lastShotTarget) then return a == lastShotTarget end
                         local ca = getPetCenter(a) or Vector3.new()
                         local cb = getPetCenter(b) or Vector3.new()
                         return (ca - playerPos).Magnitude < (cb - playerPos).Magnitude
                     end)
-                    local target = downedList[1]
-                    print("[PetESP v8.3] Auto-collect WILD downed: " .. getPetName(target) .. " | FTC=" .. tostring(freeToCatchName))
-                    tryCollectPet(target)
-                    if CONFIG.TP_BASE_AFTER_COLLECT and RUNNING then
+                    local target = fresh[1]
+                    collectTried[target] = tick()
+                    collecting = true
+                    lockTarget = nil
+                    print("[PetESP v8.3] Auto-collect: " .. getPetName(target))
+                    pcall(tryCollectPet, target)
+                    if RUNNING and CONFIG.TP_BASE_AFTER_COLLECT then
                         task.wait(0.4)
                         teleportTo(CONFIG.BASE_POS)
+                        task.wait(0.6)
                     end
+                    collecting = false
+                    if target == lastShotTarget then lastShotTarget = nil end
                 end
             end
 
