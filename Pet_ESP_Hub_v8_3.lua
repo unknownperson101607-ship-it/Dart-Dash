@@ -11,6 +11,11 @@
 --   * X button = full shutdown (every loop stops, ESP/highlights/GUI destroyed).
 --     "-" button = hide the panel; tap the small PET bubble to bring it back.
 --   * Buttons use .Activated so they work on touch.
+-- v8.3.5:
+--   * Far-away sleepers (ring not rendered): an animal we hit with the sleep dart that then stands still is
+--     treated as downed; the collector teleports next to it, and if no ring appears there it goes back to aiming.
+--   * Carry detection (player/character "carry" attribute, pet model inside the character, or a downed animal
+--     moving together with you) -> auto teleport to BASE_POS; aiming pauses while you carry.
 -- v8.3.4:
 --   * DOWNED = the green ring with the decimal seconds countdown (e.g. 111.6) above a sleeping animal.
 --     Awake wild animals (despawn timer "1:52", free-to-catch banner name match) are NOT downed any more:
@@ -105,6 +110,9 @@ local CONFIG = {
     FILL_SHOTS      = 5,             -- fill-dart shots before the sleep dart when the circles can't be read
     SLEEP_RETRY     = 2.0,           -- seconds between sleep-dart shots (saves your Abyss darts)
     AUTO_SCOPE      = true,
+    AUTO_BASE_ON_CARRY = true,       -- picked up a downed animal (by you or the script) -> go to BASE_POS
+    CARRY_MAX_SECS  = 60,            -- aiming stays paused at most this long per carry
+    STILL_SECS      = 1.5,           -- an animal we slept-darted that stands still this long counts as downed
     DOWNED_BY_BANNER = false,        -- old behaviour: banner name match marks every animal of that species as downed
     DOWNED_BY_PROMPT = false,        -- old behaviour: a catch/collect prompt marks an animal as downed
 
@@ -182,6 +190,12 @@ local freeToCatchSecs = nil                        -- countdown shown on the "Fr
 local downedAt       = setmetatable({}, {__mode = "k"})
 local sleepShotAt    = setmetatable({}, {__mode = "k"})
 local skipLogged     = setmetatable({}, {__mode = "k"})
+local anchorPos      = setmetatable({}, {__mode = "k"})   -- where an animal last "stood"
+local anchorT        = setmetatable({}, {__mode = "k"})   -- since when it has stood there
+local prevPetPos     = setmetatable({}, {__mode = "k"})
+local prevMePos      = nil
+local carrying, carryStart, lastCarrySeen = false, 0, 0
+local function carryBlocksAim() return carrying and tick() - carryStart < CONFIG.CARRY_MAX_SECS end
 
 --------------------------------------------------------------------------------
 -- Real game remotes (confirmed):
@@ -538,6 +552,14 @@ end
 
 -- The sleeping animal shows a green ring with a decimal countdown: "111.6" (seconds left asleep).
 -- Awake animals only have a despawn timer like "1:52", which is NOT this.
+local function dartSleepSeconds(dartName)
+    local l = tostring(dartName):lower()
+    for key, sec in pairs(CONFIG.SLEEP_SECONDS) do
+        if l:find(key, 1, true) then return sec end
+    end
+    return 60
+end
+
 local ringCache = setmetatable({}, {__mode = "k"})
 local function ringTimer(model)
     local c = ringCache[model]
@@ -611,16 +633,14 @@ local function isDowned(model)
 
     -- The ring countdown above a sleeping animal is the signal
     if ringTimer(model) then return true end
+    -- Ring is not rendered at long range: an animal we hit with the sleep dart that now stands still
+    local shotAt = sleepShotAt[model]
+    if shotAt and tick() - shotAt > 0.6 and tick() - shotAt < dartSleepSeconds(CONFIG.SLEEP_DART)
+       and anchorT[model] and tick() - anchorT[model] >= CONFIG.STILL_SECS then
+        return true
+    end
 
     return false
-end
-
-local function dartSleepSeconds(dartName)
-    local l = tostring(dartName):lower()
-    for key, sec in pairs(CONFIG.SLEEP_SECONDS) do
-        if l:find(key, 1, true) then return sec end
-    end
-    return 60
 end
 
 -- Seconds until a downed animal wakes (nil = unknown). Best source first:
@@ -1719,7 +1739,7 @@ task.spawn(function()
     while RUNNING do
         task.wait(CONFIG.FIRE_INTERVAL)
         local ok, err = pcall(function()
-            if not (RUNNING and CONFIG.AUTO_AIM) or collecting then scopedFor = nil return end
+            if not (RUNNING and CONFIG.AUTO_AIM) or collecting or carryBlocksAim() then scopedFor = nil return end
             local target = lockTarget
             if not (target and target.Parent) then scopedFor = nil return end
             local center = getPetCenter(target)
@@ -1800,6 +1820,37 @@ end
 --------------------------------------------------------------------------------
 -- Main loop
 --------------------------------------------------------------------------------
+-- Carry detection helpers
+local function carryAttr()
+    local function truthy(v)
+        return v == true or (type(v) == "number" and v ~= 0) or (type(v) == "string" and v ~= "" and v:lower() ~= "false")
+    end
+    for _, inst in ipairs({LocalPlayer, LocalPlayer.Character}) do
+        local okA, attrs = pcall(function() return inst:GetAttributes() end)
+        if okA then
+            for k, v in pairs(attrs) do
+                if tostring(k):lower():find("carr", 1, true) and truthy(v) then return tostring(k) end
+            end
+        end
+    end
+    return nil
+end
+
+local function carryModelInChar()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    for m in pairs(labelPets) do
+        if m.Parent and m:IsDescendantOf(char) then return m.Name end
+    end
+    for _, ch in ipairs(char:GetChildren()) do
+        if ch:IsA("Model") and (ch:FindFirstChildOfClass("Humanoid") or getAttr(ch, "PetName") ~= nil
+           or getAttr(ch, "Rarity") ~= nil or getAttr(ch, "Species") ~= nil) then
+            return ch.Name
+        end
+    end
+    return nil
+end
+
 task.spawn(function()
     while RUNNING do
         local interval = CONFIG.LOW_LAG and 0.5 or CONFIG.ESP_INTERVAL
@@ -1820,6 +1871,11 @@ task.spawn(function()
                 if pet and pet.Parent then
                     local center = getPetCenter(pet)
                     if center and (center - playerPos).Magnitude < CONFIG.ESP_MAX_DIST then
+                        local an = anchorPos[pet]
+                        if not an or (center - an).Magnitude > 0.6 then
+                            anchorPos[pet] = center
+                            anchorT[pet] = tick()
+                        end
                         local downed = isDowned(pet)
                         if not isOwnedPet(pet) and not isInBase(center) then
                             if downed then
@@ -1887,7 +1943,7 @@ task.spawn(function()
                     pick = cur
                 end
             end
-            lockTarget = (CONFIG.AUTO_AIM and not collecting) and pick or nil
+            lockTarget = (CONFIG.AUTO_AIM and not collecting and not carryBlocksAim()) and pick or nil
 
             local topN = CONFIG.LOW_LAG and 8 or CONFIG.TOP_N
             local keep = {}
@@ -1964,8 +2020,43 @@ task.spawn(function()
 
             if statusLabel then
                 local tn = lockTarget and getPetName(lockTarget) or "none"
-                statusLabel.Text = "World: " .. tostring(currentWorldName) .. " | Pets: " .. #espCandidates .. " | Lock: " .. tn .. " | Downed: " .. #downedList
+                statusLabel.Text = "World: " .. tostring(currentWorldName) .. " | Pets: " .. #espCandidates .. " | Lock: " .. tn .. " | Downed: " .. #downedList .. (carrying and " | CARRYING" or "")
                     .. (freeToCatchName and (" | FTC: " .. freeToCatchName) or "")
+            end
+
+            -- Carry detection: when a downed animal is picked up, go to the base spot
+            do
+                local meDelta = prevMePos and (playerPos - prevMePos).Magnitude or 0
+                local why = carryAttr() and ("attribute " .. tostring(carryAttr()))
+                    or (carryModelInChar() and ("model " .. tostring(carryModelInChar()))) or nil
+                if not why and prevMePos and meDelta > 1.5 then
+                    for _, pet in ipairs(downedList) do
+                        local c = getPetCenter(pet)
+                        local prev = prevPetPos[pet]
+                        if c and prev and (c - playerPos).Magnitude < 12
+                           and ((c - prev) - (playerPos - prevMePos)).Magnitude < 1.5 then
+                            why = "moving with " .. getPetName(pet)
+                            break
+                        end
+                    end
+                end
+                for _, pet in ipairs(downedList) do prevPetPos[pet] = getPetCenter(pet) end
+                prevMePos = playerPos
+
+                if why then
+                    lastCarrySeen = tick()
+                    if not carrying then
+                        carrying, carryStart = true, tick()
+                        print("[PetESP v8.3] carrying detected (" .. why .. ")")
+                        if CONFIG.AUTO_BASE_ON_CARRY and not collecting
+                           and (playerPos - CONFIG.BASE_POS).Magnitude > 25 then
+                            teleportTo(CONFIG.BASE_POS)
+                            print("[PetESP v8.3] -> base")
+                        end
+                    end
+                elseif carrying and tick() - lastCarrySeen > 3 then
+                    carrying = false
+                end
             end
 
             -- Collect downed animals (best first) and carry them to the base spot before they wake
@@ -2007,23 +2098,33 @@ task.spawn(function()
                         .. (left0 and (" (" .. fmtTime(left0) .. " left)") or ""))
 
                     local parentBefore = target.Parent
-                    local carried = false
+                    local assumed = ringTimer(target) == nil     -- ring not visible from here
+                    local carried, notAsleep = false, false
                     for _ = 1, CONFIG.COLLECT_ATTEMPTS do
                         if not RUNNING then break end
                         pcall(tryCollectPet, target)
                         task.wait(0.3)
+                        -- we stand next to it now, so the ring must be visible if it really sleeps
+                        if assumed and ringTimer(target) == nil and not carryAttr() and not carryModelInChar()
+                           and target.Parent == parentBefore then
+                            sleepShotAt[target] = nil
+                            notAsleep = true
+                            break
+                        end
                         local char = LocalPlayer.Character
                         local carrier = getAttr(target, "Carrier") or getAttr(target, "CarriedBy") or getAttr(target, "Holder")
                         carried = (not target.Parent) or target.Parent ~= parentBefore
                             or (char ~= nil and target:IsDescendantOf(char))
                             or (carrier ~= nil and (tostring(carrier) == LocalPlayer.Name or carrier == LocalPlayer.UserId))
+                        carried = carried or (carryAttr() ~= nil) or (carryModelInChar() ~= nil)
                         if carried then break end
                         local left = sleepLeft(target)
                         if left and left < CONFIG.MIN_SLEEP_LEFT then break end
                     end
-                    print("[PetESP v8.3] pick-up " .. (carried and "confirmed" or "unverified"))
+                    print(notAsleep and "[PetESP v8.3] no ring up close: it is not asleep - back to aiming"
+                        or ("[PetESP v8.3] pick-up " .. (carried and "confirmed" or "unverified")))
 
-                    if RUNNING and CONFIG.TP_BASE_AFTER_COLLECT and (carried or CONFIG.TP_BASE_EVEN_IF_UNVERIFIED) then
+                    if RUNNING and not notAsleep and CONFIG.TP_BASE_AFTER_COLLECT and (carried or CONFIG.TP_BASE_EVEN_IF_UNVERIFIED) then
                         task.wait(0.2)
                         teleportTo(CONFIG.BASE_POS)
                         task.wait(0.6)
